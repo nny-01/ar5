@@ -502,11 +502,31 @@ class AlignmentRegion(nn.Module):
     ``[rgb, ir]`` in place of the scalar):
         - [[rgb_idx, ir_idx], 1, AlignmentRegion, [256, 1, 128, 1, 512, False, 1, 0.5, [0.20, 0.15], [0.20, 0.15]]]
 
-    Args kept unchanged as much as possible:
+    YAML usage example with adaptive per-image top-k% confident gating
+    (enables Plan A: picks the top 50% most-confident positions per image
+    per modality, floored by ``threshold``; use to break the runaway
+    "strong modality monopolises confident, weak modality gets rewritten"
+    feedback loop):
+        - [[rgb_idx, ir_idx], 1, AlignmentRegion, [256, 1, 128, 1, 512, False, 1, 0.5, 0.15, 0.20, 0.5]]
+    or with independent RGB/IR target ratios:
+        - [[rgb_idx, ir_idx], 1, AlignmentRegion, [256, 1, 128, 1, 512, False, 1, 0.5, 0.15, 0.20, [0.5, 0.5]]]
+
+    Args:
         c1, c2, n=1, ec=128, nh=1, gc=512, shortcut=False, g=1, e=0.5,
-        threshold=0.20, desc_high=0.20
+        threshold=0.20, desc_high=0.20, target_confident_ratio=None
     ``threshold`` and ``desc_high`` may each be a scalar (shared by RGB and
     IR, the previous behaviour) or a 2-element list/tuple ``[rgb, ir]``.
+    ``target_confident_ratio`` (scalar or ``[rgb, ir]``):
+      - ``None`` (default) keeps the original fixed-threshold rule
+        ``confident = (raw_class_sim >= threshold)``.
+      - A value in ``(0, 1]`` switches to **adaptive per-image top-k%**
+        gating: per sample in the batch, per modality, take the top
+        ``target_confident_ratio`` fraction of spatial positions and mark
+        them confident, floored by ``threshold`` (positions below
+        ``threshold`` are never promoted even if they land in the top-k).
+        This guarantees both modalities have comparable confident counts
+        regardless of absolute similarity scale, eliminating the
+        strong/weak asymmetry feedback loop.
     """
 
     def __init__(
@@ -522,6 +542,7 @@ class AlignmentRegion(nn.Module):
         e=0.5,
         threshold=0.20,
         desc_high=0.20,
+        target_confident_ratio=None,
     ):
         super().__init__()
         self.c = int(c2 * e)
@@ -538,12 +559,38 @@ class AlignmentRegion(nn.Module):
                 return float(value[0]), float(value[1])
             return float(value), float(value)
 
+        def _split_optional_modality(value, name: str):
+            if value is None:
+                return None, None
+            if isinstance(value, (list, tuple)):
+                if len(value) != 2:
+                    raise ValueError(
+                        f"AlignmentRegion.{name} must be None, a scalar or a "
+                        f"2-element list/tuple [rgb, ir]; got length {len(value)}."
+                    )
+                return (None if value[0] is None else float(value[0]),
+                        None if value[1] is None else float(value[1]))
+            return float(value), float(value)
+
         thr_rgb, thr_ir = _split_modality(threshold, "threshold")
         dhi_rgb, dhi_ir = _split_modality(desc_high, "desc_high")
+        tgt_rgb, tgt_ir = _split_optional_modality(
+            target_confident_ratio, "target_confident_ratio"
+        )
+        for _name, _v in (
+            ("target_confident_ratio_rgb", tgt_rgb),
+            ("target_confident_ratio_ir", tgt_ir),
+        ):
+            if _v is not None and not (0.0 < _v <= 1.0):
+                raise ValueError(
+                    f"AlignmentRegion.{_name} must be in (0, 1] or None; got {_v}."
+                )
         self.threshold_rgb = thr_rgb
         self.threshold_ir = thr_ir
         self.desc_high_rgb = dhi_rgb
         self.desc_high_ir = dhi_ir
+        self.target_confident_ratio_rgb = tgt_rgb
+        self.target_confident_ratio_ir = tgt_ir
         # keep the pre-split attribute names as back-compat aliases (point at
         # the RGB values); downstream code that only queried .threshold /
         # .desc_high for logging continues to work.
@@ -741,6 +788,40 @@ class AlignmentRegion(nn.Module):
         if mask is None:
             return 0.0
         return float(mask.detach().float().mean().item())
+
+    @staticmethod
+    def _adaptive_topk_mask(sim: torch.Tensor, target_ratio: float,
+                            floor: float) -> torch.Tensor:
+        """Per-image adaptive top-k% mask with an absolute floor.
+
+        ``sim`` has shape ``(B, H, W)``. For each image (row in the batch)
+        we mark the top ``ceil(target_ratio * H*W)`` spatial positions as
+        True; positions below ``floor`` are then demoted to False so a
+        very-low-similarity image never ends up with bogus "confident"
+        positions just because they happen to be the local maxima.
+
+        The point of this is to make the confident count comparable across
+        modalities regardless of their absolute similarity scale: if IR's
+        class-similarity distribution sits, say, 0.05 lower than RGB's
+        globally, a fixed threshold would let RGB monopolise the confident
+        branch while IR is flooded into the recover branch (which then
+        rewrites IR features against RGB's confident bank — the runaway
+        feedback loop the user observed). Taking top-k% per image keeps
+        confident counts balanced.
+        """
+        if target_ratio >= 1.0:
+            # Everything above the floor counts; skip the topk work.
+            return sim >= floor
+        B = sim.shape[0]
+        flat = sim.reshape(B, -1)
+        n = flat.shape[1]
+        # round up so that very small feature maps still yield at least a
+        # handful of confident positions.
+        k = max(1, min(n, int(math.ceil(target_ratio * n))))
+        # kth largest value per row (= adaptive threshold for that image)
+        kth = flat.topk(k, dim=1, largest=True).values[:, -1:]
+        mask = (flat >= kth) & (flat >= floor)
+        return mask.reshape(sim.shape)
 
     def _feature_delta_ratio(self, before, after):
         num = (after - before).detach().pow(2).mean().sqrt()
@@ -1010,7 +1091,13 @@ class AlignmentRegion(nn.Module):
 
         thr = self.threshold_ir if tag == "ir" else self.threshold_rgb
         dhi = self.desc_high_ir if tag == "ir" else self.desc_high_rgb
-        confident_mask = (raw_class_sim >= thr)
+        tgt = (self.target_confident_ratio_ir if tag == "ir"
+               else self.target_confident_ratio_rgb)
+        if tgt is None:
+            confident_mask = (raw_class_sim >= thr)
+        else:
+            confident_mask = self._adaptive_topk_mask(raw_class_sim, tgt, thr)
+            self.debug_stats[f"{tag}_target_confident_ratio"] = float(tgt)
         uncertain_mask = ~confident_mask
         recover_mask = uncertain_mask & (raw_desc_sim >= dhi)
 

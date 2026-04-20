@@ -701,6 +701,69 @@ class AlignmentRegion(nn.Module):
         self._debug_iter = 0
         self.debug_stats = {}
 
+        # ---------------------------
+        # Symmetric IR init
+        # ---------------------------
+        # RGB and IR branches are intentionally structurally identical. We
+        # therefore force the IR branch to start from **exactly** the same
+        # parameter tensors as the RGB branch.
+        #
+        # Why: pretrained YOLO checkpoints do not contain AR module weights, so
+        # both `proj_rgb` and `proj_ir` (and their sibling Conv/C2f modules)
+        # start from independent random inits. Independent random 1x1 projections
+        # in 512d space can easily produce *opposite sign* alignments with the
+        # class embeddings — empirically we observed
+        #     rgb_raw_class_mean = +0.53
+        #     ir_raw_class_mean  = -0.39
+        # which breaks Plan A (the IR branch sees every position below floor and
+        # nothing can be marked confident).
+        #
+        # Mirroring RGB -> IR at the end of __init__ guarantees identical
+        # projections at step 0. Any divergence afterwards is driven purely by
+        # the two modalities seeing different feature distributions through
+        # otherwise-identical modules, which is the *intended* source of
+        # asymmetry (learned, not random).
+        self._sync_ir_from_rgb()
+
+    def _sync_ir_from_rgb(self):
+        """Copy RGB-branch parameters and buffers into the matching IR-branch
+        modules so both start from identical tensors.
+
+        Pairs synced:
+            cv1_rgb -> cv1_ir
+            cv2_rgb -> cv2_ir
+            m_rgb   -> m_ir         (nn.ModuleList)
+            proj_rgb -> proj_ir
+            back_rgb -> back_ir
+
+        Uses ``load_state_dict(strict=True)`` on each pair, which also copies
+        BatchNorm running_mean / running_var / num_batches_tracked, matching the
+        post-training behaviour of the RGB BNs onto the IR BNs at t=0.
+        """
+        import torch as _torch  # local alias, avoid top-of-file touching
+        with _torch.no_grad():
+            pairs = [
+                ("cv1", self.cv1_rgb, self.cv1_ir),
+                ("cv2", self.cv2_rgb, self.cv2_ir),
+                ("m",   self.m_rgb,   self.m_ir),
+                ("proj", self.proj_rgb, self.proj_ir),
+                ("back", self.back_rgb, self.back_ir),
+            ]
+            for _, src, dst in pairs:
+                # Guard against shape mismatches (would only happen if someone
+                # tweaks one branch's definition and forgets the other). We
+                # iterate state_dict entries manually so a single mismatched
+                # tensor does not abort the entire sync.
+                src_sd = src.state_dict()
+                dst_sd = dst.state_dict()
+                new_dst_sd = {}
+                for k, v in dst_sd.items():
+                    if k in src_sd and src_sd[k].shape == v.shape:
+                        new_dst_sd[k] = src_sd[k].clone()
+                    else:
+                        new_dst_sd[k] = v
+                dst.load_state_dict(new_dst_sd, strict=True)
+
     # ============================================================
     # public setters
     # ============================================================

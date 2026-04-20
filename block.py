@@ -749,6 +749,7 @@ class AlignmentRegion(nn.Module):
                 ("proj", self.proj_rgb, self.proj_ir),
                 ("back", self.back_rgb, self.back_ir),
             ]
+            tensors_copied = 0
             for _, src, dst in pairs:
                 # Guard against shape mismatches (would only happen if someone
                 # tweaks one branch's definition and forgets the other). We
@@ -760,9 +761,27 @@ class AlignmentRegion(nn.Module):
                 for k, v in dst_sd.items():
                     if k in src_sd and src_sd[k].shape == v.shape:
                         new_dst_sd[k] = src_sd[k].clone()
+                        tensors_copied += 1
                     else:
                         new_dst_sd[k] = v
                 dst.load_state_dict(new_dst_sd, strict=True)
+
+        # Post-sync sanity check: verify proj_rgb.0.weight == proj_ir.0.weight.
+        # If these differ, either the sync never ran (file mismatch) or PyTorch
+        # cache is stale. The message prints unconditionally so the user can
+        # confirm in their training log that the right block.py is loaded.
+        try:
+            w_rgb = self.proj_rgb[0].weight.detach()
+            w_ir  = self.proj_ir[0].weight.detach()
+            max_abs_diff = (w_rgb - w_ir).abs().max().item()
+            print(
+                f"[AlignmentRegion] _sync_ir_from_rgb: "
+                f"copied {tensors_copied} tensors, "
+                f"proj_rgb.weight vs proj_ir.weight max|diff|={max_abs_diff:.2e} "
+                f"(should be 0.00e+00 if sync worked)"
+            )
+        except Exception as e:
+            print(f"[AlignmentRegion] _sync_ir_from_rgb sanity-check failed: {e!r}")
 
     # ============================================================
     # public setters

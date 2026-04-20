@@ -87,8 +87,12 @@ IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
 
 # --- 数据集与输入输出路径 ---
 DATA = "ultralytics/cfg/datasets/M3FD-rgbt.yaml"                   # 数据集 YAML
-DESC_RGB = "prompts/M3FD_prompts/perclass_desc_rgb_embeddings.pt"  # 原始 RGB 描述嵌入
-DESC_IR = "prompts/M3FD_prompts/perclass_desc_ir_embeddings.pt"    # 原始 IR 描述嵌入
+# DESC_RGB / DESC_IR 可以是：
+#   (a) 一个 .pt 文件（dict 带 class_map，或 tensor+同名 .class_map.pt），
+#   (b) 一个目录，里面按类放 {class_name}_desc_{rgb|ir}_embeddings.pt。
+# 默认用 (b)，匹配 generate_prompts.py 旧版的 per-class 输出布局。
+DESC_RGB = "prompts/M3FD_prompts"                                  # 原始 RGB 描述嵌入
+DESC_IR = "prompts/M3FD_prompts"                                   # 原始 IR 描述嵌入
 OUTPUT_DIR = "prompts/M3FD_prompts/adapted"                        # adapted 嵌入输出目录
 
 # --- 适配超参数 ---
@@ -466,35 +470,97 @@ def _blend_descriptions(
     return out
 
 
-def _load_desc_file(path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Load a per-class description file and return (embeddings, class_map).
+def _load_desc_file(
+    path: Path,
+    class_names: Optional[Sequence[str]] = None,
+    modality: Optional[str] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Load description embeddings and return ``(embeddings, class_map)``.
 
-    The file is expected to be saved by ``generate_prompts.py`` in its
-    per-class mode, i.e. a dict with keys ``embeddings`` (N, 512) and
-    ``class_map`` (N,). A plain tensor is also tolerated for backward
-    compatibility but requires ``class_map`` to be provided via a companion
-    ``.class_map.pt`` file with the same stem; otherwise loading fails.
+    Accepts three layouts:
+
+    1. ``path`` is a single ``.pt`` saved as a dict ``{'embeddings', 'class_map'}``
+       (the canonical output of ``generate_prompts.py --mode perclass``).
+    2. ``path`` is a single ``.pt`` tensor plus a companion file
+       ``<stem>.class_map.pt`` at the same location.
+    3. ``path`` is a **directory** containing one file per class named
+       ``{class_name}_desc_{rgb|ir}_embeddings.pt`` (older ``generate_prompts.py``
+       style). The files are concatenated in the order of ``class_names`` and
+       a class_map is synthesised from the class index.
+
+    In mode (3) both ``class_names`` and ``modality`` (``"rgb"`` or ``"ir"``)
+    must be passed in.
     """
+    if path.is_dir():
+        if class_names is None or modality not in ("rgb", "ir"):
+            raise ValueError(
+                f"{path} is a directory but class_names / modality were not "
+                "provided to _load_desc_file."
+            )
+        embs: List[torch.Tensor] = []
+        cmap: List[int] = []
+        missing: List[str] = []
+        for cls_idx, cls_name in enumerate(class_names):
+            candidate = path / f"{cls_name}_desc_{modality}_embeddings.pt"
+            if not candidate.exists():
+                missing.append(cls_name)
+                continue
+            blob = torch.load(str(candidate), map_location="cpu")
+            if isinstance(blob, dict):
+                t = blob.get("embeddings", None)
+                if t is None:
+                    raise ValueError(
+                        f"{candidate} is a dict but has no 'embeddings' key"
+                    )
+            else:
+                t = blob
+            if not torch.is_tensor(t):
+                raise ValueError(
+                    f"{candidate} has unsupported content: {type(blob)}"
+                )
+            t = t.float().reshape(-1, t.shape[-1])
+            embs.append(t)
+            cmap.extend([cls_idx] * t.shape[0])
+            log.info(
+                "  loaded %s: %d descriptions (class_id=%d)",
+                candidate.name, t.shape[0], cls_idx,
+            )
+        if not embs:
+            raise FileNotFoundError(
+                f"No per-class description files found under {path} with "
+                f"pattern '{{class}}_desc_{modality}_embeddings.pt'"
+            )
+        if missing:
+            log.warning(
+                "Missing per-class description files for %s in %s (modality=%s); "
+                "those classes will keep their CLIP anchor without desc blending.",
+                missing, path, modality,
+            )
+        return torch.cat(embs, dim=0), torch.tensor(cmap, dtype=torch.long)
+
     data = torch.load(str(path), map_location="cpu")
     if isinstance(data, dict):
         emb = data["embeddings"]
-        cmap = data.get("class_map", None)
-        if cmap is None:
+        cmap_t = data.get("class_map", None)
+        if cmap_t is None:
             raise ValueError(
                 f"{path} is a dict but has no 'class_map' key; "
                 "per-class mode requires a class_map tensor."
             )
-        return emb.float(), cmap.long()
+        return emb.float(), cmap_t.long()
     if torch.is_tensor(data):
         companion = path.with_suffix(".class_map.pt")
         if not companion.exists():
             raise ValueError(
-                f"{path} is a plain tensor with no accompanying class_map; "
-                "re-run generate_prompts.py with --mode perclass to produce "
-                "dict-format embeddings."
+                f"{path} is a plain tensor with no accompanying class_map. "
+                f"Either (a) re-run generate_prompts.py with --mode perclass to "
+                f"produce dict-format embeddings, or (b) point DESC_RGB / DESC_IR "
+                f"at the directory that contains per-class files "
+                f"'{{class_name}}_desc_<rgb|ir>_embeddings.pt' so the adapter can "
+                f"concatenate them itself."
             )
-        cmap = torch.load(str(companion), map_location="cpu").long()
-        return data.float(), cmap
+        cmap_t = torch.load(str(companion), map_location="cpu").long()
+        return data.float(), cmap_t
     raise ValueError(f"Unsupported content in {path}: {type(data)}")
 
 
@@ -677,8 +743,10 @@ def run_adaptation(args: argparse.Namespace) -> None:
     # ---- desc anchors -----------------------------------------------------
     desc_rgb_path = Path(args.desc_rgb)
     desc_ir_path = Path(args.desc_ir)
-    desc_rgb_clip, desc_rgb_cmap = _load_desc_file(desc_rgb_path)
-    desc_ir_clip, desc_ir_cmap = _load_desc_file(desc_ir_path)
+    log.info("Loading RGB description embeddings from %s", desc_rgb_path)
+    desc_rgb_clip, desc_rgb_cmap = _load_desc_file(desc_rgb_path, class_names, "rgb")
+    log.info("Loading IR description embeddings from %s", desc_ir_path)
+    desc_ir_clip, desc_ir_cmap = _load_desc_file(desc_ir_path, class_names, "ir")
 
     # ---- blending ---------------------------------------------------------
     log.info("Blending class embeddings (alpha_class=%.3f)", args.alpha_class)

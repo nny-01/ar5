@@ -66,7 +66,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 import yaml
-from PIL import Image
+from PIL import Image, ImageFile
+
+# Some training datasets contain slightly truncated PNG/JPEG files. PIL
+# raises ``OSError: image file is truncated`` on those by default, which
+# would abort a full-dataset scan. We tell PIL to decode whatever bytes it
+# has and we defensively re-try / skip any image that still fails below.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("offline_embedding_adapter")
@@ -91,7 +97,9 @@ ALPHA_DESC = 0.2     # desc embedding 融合权重（建议 0.15 ~ 0.25）
 
 # --- 数据扫描与 CLIP ---
 SPLIT = "train"                        # 用哪个 split（train / val，可逗号分隔）
-IR_REPLACE = ["images:images_ir"]      # 从 RGB 路径推导 IR 路径的替换规则，可给多条
+IR_REPLACE = ["/vi/:/ir/"]             # 从 RGB 路径推导 IR 路径的替换规则，可给多条
+                                       # M3FD_YOLOWORLD 用 /vi/:/ir/；如果你的 IR 放在 images_ir/
+                                       # 下请改成 "images:images_ir"；可以叠加多条规则
 CLIP_MODEL = "ViT-B/32"                # CLIP 模型名
 DEVICE = "cuda" if __import__("torch").cuda.is_available() else "cpu"
 BATCH_SIZE = 64                        # CLIP 图像编码 batch size
@@ -281,26 +289,89 @@ def _ensure_rgb(img: Image.Image) -> Image.Image:
     return img
 
 
+def _safe_open_image(path: Path) -> Optional[Image.Image]:
+    """Open an image, force-load its pixel data, and convert to RGB.
+
+    Returns ``None`` (and logs a warning) if the file is missing, unreadable,
+    or too corrupted to decode even with ``LOAD_TRUNCATED_IMAGES = True``.
+    """
+    try:
+        img = Image.open(path)
+        img.load()  # force decoding now so later .crop() cannot raise
+        return _ensure_rgb(img)
+    except (OSError, ValueError, SyntaxError) as exc:
+        log.warning("Skipping unreadable image %s: %s", path, exc)
+        return None
+
+
 def _crop_pil(img: Image.Image, box: GTBox, min_side: int = 8) -> Optional[Image.Image]:
     w, h = img.size
     x1, y1, x2, y2 = box.xyxy(w, h)
     if x2 - x1 < min_side or y2 - y1 < min_side:
         return None
-    return img.crop((x1, y1, x2, y2))
+    try:
+        return img.crop((x1, y1, x2, y2))
+    except (OSError, ValueError) as exc:
+        log.warning("Skipping corrupt crop in image (box=%s): %s", box, exc)
+        return None
 
 
 @torch.no_grad()
 def _encode_crops(
     model, preprocess, crops: List[Image.Image], device: torch.device, batch_size: int
 ) -> torch.Tensor:
+    """Encode a list of PIL crops with the CLIP image encoder.
+
+    Crops that raise during ``preprocess`` (corrupted pixel data) are silently
+    dropped rather than aborting the batch; a matching outer list of class
+    IDs must be filtered in sync — see ``_encode_crops_aligned``.
+    """
     feats: List[torch.Tensor] = []
     for i in range(0, len(crops), batch_size):
-        batch = torch.stack([preprocess(c) for c in crops[i : i + batch_size]]).to(device)
+        tensors: List[torch.Tensor] = []
+        for c in crops[i : i + batch_size]:
+            try:
+                tensors.append(preprocess(c))
+            except (OSError, ValueError) as exc:  # pragma: no cover - defensive
+                log.warning("Skipping crop that failed CLIP preprocess: %s", exc)
+        if not tensors:
+            continue
+        batch = torch.stack(tensors).to(device)
         f = model.encode_image(batch).float()
         feats.append(f.cpu())
     if not feats:
         return torch.empty(0, 512)
     return torch.cat(feats, dim=0)
+
+
+@torch.no_grad()
+def _encode_crops_aligned(
+    model, preprocess, crops: List[Image.Image], cls_ids: List[int],
+    device: torch.device, batch_size: int,
+) -> Tuple[torch.Tensor, List[int]]:
+    """Like ``_encode_crops`` but also returns the filtered class-id list so
+    the accumulator stays aligned even if some crops are dropped mid-batch.
+    """
+    feats: List[torch.Tensor] = []
+    kept_cls: List[int] = []
+    for i in range(0, len(crops), batch_size):
+        tensors: List[torch.Tensor] = []
+        batch_cls: List[int] = []
+        for c, k in zip(crops[i : i + batch_size], cls_ids[i : i + batch_size]):
+            try:
+                tensors.append(preprocess(c))
+                batch_cls.append(k)
+            except (OSError, ValueError) as exc:  # pragma: no cover - defensive
+                log.warning("Skipping crop that failed CLIP preprocess: %s", exc)
+        if not tensors:
+            continue
+        batch = torch.stack(tensors).to(device)
+        f = model.encode_image(batch).float()
+        feats.append(f.cpu())
+        kept_cls.extend(batch_cls)
+    if not feats:
+        return torch.empty(0, 512), []
+    return torch.cat(feats, dim=0), kept_cls
 
 
 @torch.no_grad()
@@ -488,14 +559,22 @@ def run_adaptation(args: argparse.Namespace) -> None:
     def _flush():
         nonlocal buf_rgb_imgs, buf_rgb_cls, buf_ir_imgs, buf_ir_cls
         if buf_rgb_imgs:
-            feats = _encode_crops(model, preprocess, buf_rgb_imgs, device, args.batch_size)
-            rgb_accum.add(feats, buf_rgb_cls)
+            feats, kept_cls = _encode_crops_aligned(
+                model, preprocess, buf_rgb_imgs, buf_rgb_cls, device, args.batch_size
+            )
+            if feats.numel():
+                rgb_accum.add(feats, kept_cls)
             buf_rgb_imgs, buf_rgb_cls = [], []
         if buf_ir_imgs:
-            feats = _encode_crops(model, preprocess, buf_ir_imgs, device, args.batch_size)
-            ir_accum.add(feats, buf_ir_cls)
+            feats, kept_cls = _encode_crops_aligned(
+                model, preprocess, buf_ir_imgs, buf_ir_cls, device, args.batch_size
+            )
+            if feats.numel():
+                ir_accum.add(feats, kept_cls)
             buf_ir_imgs, buf_ir_cls = [], []
 
+    ir_rule_noop_warned = False
+    ir_missing_first_examples: List[Tuple[Path, Path]] = []
     processed = 0
     for rgb_path in all_imgs:
         label_path = _rgb_to_label(rgb_path)
@@ -504,19 +583,26 @@ def run_adaptation(args: argparse.Namespace) -> None:
             continue
 
         ir_path = _rgb_to_ir(rgb_path, ir_rules)
-        try:
-            rgb_img = _ensure_rgb(Image.open(rgb_path))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Failed to open RGB image %s: %s", rgb_path, exc)
+        # Surface obvious mis-configurations early so the user doesn't
+        # silently end up with zero IR samples.
+        if ir_path == rgb_path and not ir_rule_noop_warned:
+            log.warning(
+                "IR substitution rule(s) %s did not change the RGB path (%s); "
+                "IR prototypes will stay empty. Fix IR_REPLACE at the top of the "
+                "script (e.g. 'vi:ir' or '/vi/:/ir/') or pass --ir-replace.",
+                ir_rules, rgb_path,
+            )
+            ir_rule_noop_warned = True
+        if not ir_path.exists() and len(ir_missing_first_examples) < 3:
+            ir_missing_first_examples.append((rgb_path, ir_path))
+
+        rgb_img = _safe_open_image(rgb_path)
+        if rgb_img is None:
             continue
 
         ir_img: Optional[Image.Image] = None
         if ir_path.exists():
-            try:
-                ir_img = _ensure_rgb(Image.open(ir_path))
-            except Exception as exc:  # noqa: BLE001
-                log.warning("Failed to open IR image %s: %s", ir_path, exc)
-                ir_img = None
+            ir_img = _safe_open_image(ir_path)
 
         for box in boxes:
             if per_class_cap is not None and rgb_accum.count[box.cls].item() >= per_class_cap and \
@@ -553,6 +639,17 @@ def run_adaptation(args: argparse.Namespace) -> None:
     _flush()
 
     log.info("Finished crop encoding: RGB total=%d, IR total=%d", int(rgb_accum.count.sum()), int(ir_accum.count.sum()))
+    if int(ir_accum.count.sum()) == 0 and ir_missing_first_examples:
+        examples = "\n    ".join(
+            f"{r}\n        -> tried IR: {i}" for r, i in ir_missing_first_examples
+        )
+        log.error(
+            "No IR images were found. The current IR substitution rule(s) %s "
+            "do not resolve to existing files. Examples:\n    %s\n"
+            "Fix IR_REPLACE at the top of the script (e.g. 'vi:ir' for the "
+            "M3FD_YOLOWORLD layout) or pass --ir-replace.",
+            ir_rules, examples,
+        )
     if (rgb_accum.count == 0).any():
         missing = [class_names[i] for i in (rgb_accum.count == 0).nonzero(as_tuple=False).flatten().tolist()]
         log.warning("Classes without any RGB crops (CLIP anchor only): %s", missing)

@@ -994,14 +994,74 @@ class RGBTARDetModel(DetectionModel):
         self.model[-1].nc = len(text)
 
         # Push class embeddings into all AR modules
+        count = self._sync_class_to_ar()
+
+        LOGGER.info(
+            f"RGBTARDetModel: set {len(text)} classes, stored in {count} AR module(s)"
+        )
+
+    def _sync_class_to_ar(self):
+        """Push the currently-stored class embeddings (``self.txt_feats``)
+        into every AR module in the model.
+
+        Returns:
+            int: number of AR modules that received the embeddings.
+        """
         count = 0
         for m in self.model.modules():
             if isinstance(m, AR):
                 m.set_class_embeddings(self.txt_feats)
                 count += 1
+        return count
 
+    def load_class_embeddings(self, path):
+        """Load pre-computed class embeddings from a ``.pt`` file and push
+        them into every AR module.
+
+        This is the offline counterpart of :meth:`set_classes`. It bypasses
+        the CLIP text encoder entirely so the embeddings can come from the
+        offline dataset-adaptation pipeline (see
+        ``tools/offline_embedding_adapter.py``).
+
+        The file may contain either:
+
+        * a plain ``Tensor`` of shape ``(nc, C)`` or ``(1, nc, C)``, or
+        * a ``dict`` with key ``embeddings`` holding such a tensor.
+
+        The ``nc`` dimension must match the current head's class count.
+        """
+        data = torch.load(str(path), map_location="cpu")
+        if isinstance(data, dict):
+            feats = data.get("embeddings", None)
+            if feats is None:
+                raise ValueError(
+                    f"[AR] class embedding file {path} is a dict but has no 'embeddings' key"
+                )
+        else:
+            feats = data
+        if not torch.is_tensor(feats):
+            raise TypeError(f"[AR] unsupported class embedding payload in {path}: {type(feats)}")
+        feats = feats.float()
+        if feats.dim() == 2:
+            feats = feats.unsqueeze(0)  # (1, nc, C)
+        if feats.dim() != 3:
+            raise ValueError(
+                f"[AR] class embedding tensor must be 2D or 3D, got shape {tuple(feats.shape)}"
+            )
+
+        expected_nc = getattr(self.model[-1], "nc", feats.shape[1])
+        if feats.shape[1] != expected_nc:
+            raise ValueError(
+                f"[AR] class embedding count mismatch: file has {feats.shape[1]} classes but "
+                f"head expects {expected_nc}"
+            )
+
+        self.txt_feats = feats
+        self.model[-1].nc = feats.shape[1]
+        count = self._sync_class_to_ar()
         LOGGER.info(
-            f"RGBTARDetModel: set {len(text)} classes, stored in {count} AR module(s)"
+            f"[AR] Loaded adapted class embeddings from {path}: "
+            f"shape={tuple(feats.shape)}, synced to {count} AR module(s)"
         )
 
     def _sync_rel_to_ar(self):

@@ -41,16 +41,16 @@ Outputs (into ``--output-dir``)
 
 Usage
 -----
-    python tools/offline_embedding_adapter.py \
-        --data ultralytics/cfg/datasets/M3FD-rgbt.yaml \
-        --desc-rgb prompts/M3FD_prompts/perclass_desc_rgb_embeddings.pt \
-        --desc-ir  prompts/M3FD_prompts/perclass_desc_ir_embeddings.pt \
-        --output-dir prompts/M3FD_prompts/adapted \
-        --alpha-class 0.1 \
-        --alpha-desc 0.2 \
-        --split train \
-        --ir-replace images:images_ir \
-        --device cuda:0
+Parameters live in the ``CONFIG`` section at the top of this file
+(``DATA``, ``DESC_RGB``, ``DESC_IR``, ``OUTPUT_DIR``, ``ALPHA_CLASS``,
+``ALPHA_DESC``, ``IR_REPLACE`` ...). Edit those and then just run::
+
+    python offline_embedding_adapter.py
+
+Every CLI flag is optional and, if given, overrides the corresponding
+default from the CONFIG section. For example::
+
+    python offline_embedding_adapter.py --alpha-class 0.05 --split train,val
 """
 
 from __future__ import annotations
@@ -72,6 +72,43 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("offline_embedding_adapter")
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
+
+
+# ============================================================
+# 训练前需要修改的参数 —— 直接改这里即可，无需命令行
+# 命令行参数仍然可用，如果传了会覆盖这里的默认值
+# ============================================================
+
+# --- 数据集与输入输出路径 ---
+DATA = "ultralytics/cfg/datasets/M3FD-rgbt.yaml"                   # 数据集 YAML
+DESC_RGB = "prompts/M3FD_prompts/perclass_desc_rgb_embeddings.pt"  # 原始 RGB 描述嵌入
+DESC_IR = "prompts/M3FD_prompts/perclass_desc_ir_embeddings.pt"    # 原始 IR 描述嵌入
+OUTPUT_DIR = "prompts/M3FD_prompts/adapted"                        # adapted 嵌入输出目录
+
+# --- 适配超参数 ---
+ALPHA_CLASS = 0.1    # class embedding 融合权重（CLIP 锚点主导，建议 0.1 左右）
+ALPHA_DESC = 0.2     # desc embedding 融合权重（建议 0.15 ~ 0.25）
+
+# --- 数据扫描与 CLIP ---
+SPLIT = "train"                        # 用哪个 split（train / val，可逗号分隔）
+IR_REPLACE = ["images:images_ir"]      # 从 RGB 路径推导 IR 路径的替换规则，可给多条
+CLIP_MODEL = "ViT-B/32"                # CLIP 模型名
+DEVICE = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+BATCH_SIZE = 64                        # CLIP 图像编码 batch size
+
+# --- 规模控制（调试时可以限一下）---
+MAX_IMAGES = 0                         # 扫描图像数上限（0 = 不限制）
+MAX_BOXES_PER_CLASS = 0                # 每类每模态 box 数上限（0 = 不限制）
+MIN_BOX_SIDE = 8                       # 小于此像素的 box 会被丢弃
+
+# --- 其他 ---
+SAVE_STATS = True                      # 保存 prototype_stats.pt
+SEED = 0
+LOG_EVERY = 200
+
+# ============================================================
+# 以下为实现细节，通常不需要修改
+# ============================================================
 
 
 # ---------------------------------------------------------------------------
@@ -619,50 +656,81 @@ def run_adaptation(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser. All arguments default to the module-level
+    constants at the top of this file, so the script can also be run with
+    no arguments at all: ``python offline_embedding_adapter.py``.
+    """
     p = argparse.ArgumentParser(
         description="Offline CLIP-anchor + dataset-prototype embedding adapter "
-        "for RGBT AR training.",
+        "for RGBT AR training. Defaults come from the CONFIG section at the "
+        "top of this file; CLI flags override those defaults.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--data", required=True, help="Path to dataset YAML file.")
-    p.add_argument("--desc-rgb", required=True, help="Path to original RGB description embeddings .pt")
-    p.add_argument("--desc-ir", required=True, help="Path to original IR description embeddings .pt")
-    p.add_argument("--output-dir", required=True, help="Directory to write adapted embeddings into.")
+    p.add_argument("--data", default=DATA, help="Path to dataset YAML file.")
+    p.add_argument("--desc-rgb", default=DESC_RGB, help="Path to original RGB description embeddings .pt")
+    p.add_argument("--desc-ir", default=DESC_IR, help="Path to original IR description embeddings .pt")
+    p.add_argument("--output-dir", default=OUTPUT_DIR, help="Directory to write adapted embeddings into.")
 
-    p.add_argument("--clip-model", default="ViT-B/32", help="CLIP model name.")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--batch-size", type=int, default=64, help="CLIP image encoder batch size.")
+    p.add_argument("--clip-model", default=CLIP_MODEL, help="CLIP model name.")
+    p.add_argument("--device", default=DEVICE)
+    p.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="CLIP image encoder batch size.")
 
-    p.add_argument("--alpha-class", type=float, default=0.1,
+    p.add_argument("--alpha-class", type=float, default=ALPHA_CLASS,
                    help="Mixing weight for class embeddings (CLIP anchor dominates).")
-    p.add_argument("--alpha-desc", type=float, default=0.2,
+    p.add_argument("--alpha-desc", type=float, default=ALPHA_DESC,
                    help="Mixing weight for description embeddings.")
 
-    p.add_argument("--split", default="train",
+    p.add_argument("--split", default=SPLIT,
                    help="Which dataset split(s) to scan. Comma-separated.")
     p.add_argument("--ir-replace", action="append", default=None,
                    help="Substitution rule OLD:NEW used to derive IR paths from RGB paths. "
-                        "May be repeated. Default: images:images_ir")
+                        "May be repeated. If not given, falls back to IR_REPLACE at top of file.")
 
-    p.add_argument("--max-images", type=int, default=0,
+    p.add_argument("--max-images", type=int, default=MAX_IMAGES,
                    help="Upper bound on number of images scanned (0 = no cap).")
-    p.add_argument("--max-boxes-per-class", type=int, default=0,
+    p.add_argument("--max-boxes-per-class", type=int, default=MAX_BOXES_PER_CLASS,
                    help="Upper bound on number of boxes accumulated per class, per modality "
                         "(0 = no cap).")
-    p.add_argument("--min-box-side", type=int, default=8,
+    p.add_argument("--min-box-side", type=int, default=MIN_BOX_SIDE,
                    help="Minimum bounding-box side length (pixels) to include in prototype.")
 
-    p.add_argument("--save-stats", action="store_true", default=True,
+    p.add_argument("--save-stats", action="store_true", default=SAVE_STATS,
                    help="Save prototype_stats.pt for debugging.")
     p.add_argument("--no-save-stats", dest="save_stats", action="store_false")
 
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--log-every", type=int, default=200)
+    p.add_argument("--seed", type=int, default=SEED)
+    p.add_argument("--log-every", type=int, default=LOG_EVERY)
     return p
+
+
+def _validate_config(args: argparse.Namespace) -> None:
+    """Raise a helpful error if any required path is still empty.
+
+    This guards the 'zero-argument' entry point where the user is expected
+    to have filled in the CONFIG section at the top of the file.
+    """
+    missing = [
+        name for name, value in (
+            ("DATA / --data", args.data),
+            ("DESC_RGB / --desc-rgb", args.desc_rgb),
+            ("DESC_IR / --desc-ir", args.desc_ir),
+            ("OUTPUT_DIR / --output-dir", args.output_dir),
+        ) if not value
+    ]
+    if missing:
+        raise SystemExit(
+            "The following paths are empty — set them in the CONFIG section at the "
+            "top of offline_embedding_adapter.py (or pass them on the command line):\n  - "
+            + "\n  - ".join(missing)
+        )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = _build_parser().parse_args(argv)
+    # Fall back to the module-level IR_REPLACE constant if nothing was passed on the CLI.
+    if args.ir_replace is None:
+        args.ir_replace = list(IR_REPLACE) if IR_REPLACE else None
+    _validate_config(args)
     run_adaptation(args)
 
 

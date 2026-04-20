@@ -1150,6 +1150,47 @@ class RGBTARDetModel(DetectionModel):
         full_load = {**remapped_rgb, **remapped_ir, **remainder_intersected}
         self.load_state_dict(full_load, strict=False)
 
+        # ------------------------------------------------------------------
+        # Step 4: reset IR branch BatchNorm running statistics.
+        #
+        # Why: the IR branch conv weights are useful initialisations (they are
+        # RGB pretrained filters, or 3→1 averaged for the first conv), but the
+        # RGB pretrained BN running_mean / running_var encode RGB-image pixel
+        # statistics. Feeding 1-channel thermal / grayscale IR data through
+        # these RGB-tuned BNs systematically shifts features in the "wrong"
+        # direction in CLIP space, producing the ``ir_raw_class_mean ≈ -0.3``
+        # (anti-aligned with every class embedding) behaviour observed
+        # empirically.
+        #
+        # Resetting to the PyTorch default (mean=0, var=1, tracked=0) lets
+        # each IR BN freely adapt to the actual IR activation distribution
+        # during training, avoiding the systematic sign inversion. The affine
+        # parameters (``weight``, ``bias``) are kept as-loaded so the learned
+        # scale/shift is preserved.
+        # ------------------------------------------------------------------
+        import torch.nn as _nn
+        ir_layer_range = range(ir_first_layer, ir_first_layer + backbone_len)
+        bn_reset_count = 0
+        try:
+            for ir_idx in ir_layer_range:
+                if ir_idx >= len(self.model):
+                    break
+                ir_layer = self.model[ir_idx]
+                for sub in ir_layer.modules():
+                    if isinstance(sub, (_nn.BatchNorm2d, _nn.BatchNorm1d,
+                                        _nn.BatchNorm3d, _nn.SyncBatchNorm)):
+                        if sub.running_mean is not None:
+                            sub.running_mean.zero_()
+                        if sub.running_var is not None:
+                            sub.running_var.fill_(1.0)
+                        if sub.num_batches_tracked is not None:
+                            sub.num_batches_tracked.zero_()
+                        bn_reset_count += 1
+        except Exception as _e:
+            LOGGER.warning(
+                f"RGBTARDetModel.load: failed to reset IR BN running stats: {_e!r}"
+            )
+
         if verbose:
             LOGGER.info(
                 f"RGBTARDetModel.load: dual-stream remap: "
@@ -1157,7 +1198,8 @@ class RGBTARDetModel(DetectionModel):
                 f"(first-conv RGB: {first_conv_rgb_loaded}), "
                 f"IR branch loaded {len(remapped_ir)} keys "
                 f"(first-conv 3→1 averaged: {first_conv_ir_adapted}), "
-                f"post-fusion intersect: {len(remainder_intersected)} keys. "
+                f"post-fusion intersect: {len(remainder_intersected)} keys, "
+                f"IR BN running-stats reset: {bn_reset_count}. "
                 f"rgb_first_layer={rgb_first_layer}, ir_first_layer={ir_first_layer}."
             )
 

@@ -1179,6 +1179,11 @@ class RGBTARDetModel(DetectionModel):
 
             if isinstance(m, AR):
                 x = m(x, txt_feats, desc_rgb, desc_ir)
+            elif isinstance(m, WorldDetect):
+                # Route class embeddings into WorldDetect's contrastive classifier.
+                # Works with both standard Detect YAMLs (no-op, this branch never triggers)
+                # and World YAMLs where the last layer is WorldDetect.
+                x = m(x, txt_feats)
             else:
                 x = m(x)
 

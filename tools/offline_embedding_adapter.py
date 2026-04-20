@@ -96,8 +96,12 @@ DESC_IR = "prompts/M3FD_prompts"                                   # 原始 IR �
 OUTPUT_DIR = "prompts/M3FD_prompts/adapted"                        # adapted 嵌入输出目录
 
 # --- 适配超参数 ---
-ALPHA_CLASS = 0.1    # class embedding 融合权重（CLIP 锚点主导，建议 0.1 左右）
-ALPHA_DESC = 0.2     # desc embedding 融合权重（建议 0.15 ~ 0.25）
+ALPHA_CLASS = 0.1       # class embedding 融合权重（CLIP 锚点主导，建议 0.1 左右）
+# desc embedding 融合权重，RGB 和 IR 可独立设置（建议 0.15 ~ 0.25）。
+# 如果你只想用同一个值，把两者设成一样即可。
+ALPHA_DESC_RGB = 0.2    # RGB desc 融合权重
+ALPHA_DESC_IR = 0.2     # IR  desc 融合权重
+ALPHA_DESC = None       # 向后兼容：若非 None，会同时覆盖上面两个。留 None 即可。
 
 # --- 数据扫描与 CLIP ---
 SPLIT = "train"                        # 用哪个 split（train / val，可逗号分隔）
@@ -752,11 +756,11 @@ def run_adaptation(args: argparse.Namespace) -> None:
     log.info("Blending class embeddings (alpha_class=%.3f)", args.alpha_class)
     class_adapted = _blend(class_clip, combined, args.alpha_class)  # (nc, 512)
 
-    log.info("Blending RGB description embeddings (alpha_desc=%.3f)", args.alpha_desc)
-    desc_rgb_adapted = _blend_descriptions(desc_rgb_clip, desc_rgb_cmap, class_proto_rgb, args.alpha_desc)
+    log.info("Blending RGB description embeddings (alpha_desc_rgb=%.3f)", args.alpha_desc_rgb)
+    desc_rgb_adapted = _blend_descriptions(desc_rgb_clip, desc_rgb_cmap, class_proto_rgb, args.alpha_desc_rgb)
 
-    log.info("Blending IR description embeddings  (alpha_desc=%.3f)", args.alpha_desc)
-    desc_ir_adapted = _blend_descriptions(desc_ir_clip, desc_ir_cmap, class_proto_ir, args.alpha_desc)
+    log.info("Blending IR description embeddings  (alpha_desc_ir=%.3f)", args.alpha_desc_ir)
+    desc_ir_adapted = _blend_descriptions(desc_ir_clip, desc_ir_cmap, class_proto_ir, args.alpha_desc_ir)
 
     # ---- sanity: delta norms ---------------------------------------------
     def _cos(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -778,10 +782,17 @@ def run_adaptation(args: argparse.Namespace) -> None:
             "(min cosine %.3f < 0.90). Consider lowering --alpha-class.",
             float(cos_class.min()),
         )
-    if float(cos_desc_rgb.min()) < 0.80 or float(cos_desc_ir.min()) < 0.80:
+    if float(cos_desc_rgb.min()) < 0.80:
         log.warning(
-            "Some desc embeddings moved quite far from their CLIP anchor; "
-            "consider lowering --alpha-desc."
+            "RGB desc embeddings moved quite far from their CLIP anchor "
+            "(min cosine %.3f < 0.80). Consider lowering --alpha-desc-rgb.",
+            float(cos_desc_rgb.min()),
+        )
+    if float(cos_desc_ir.min()) < 0.80:
+        log.warning(
+            "IR desc embeddings moved quite far from their CLIP anchor "
+            "(min cosine %.3f < 0.80). Consider lowering --alpha-desc-ir.",
+            float(cos_desc_ir.min()),
         )
 
     # ---- save -------------------------------------------------------------
@@ -800,7 +811,8 @@ def run_adaptation(args: argparse.Namespace) -> None:
         stats = {
             "class_names": class_names,
             "alpha_class": args.alpha_class,
-            "alpha_desc": args.alpha_desc,
+            "alpha_desc_rgb": args.alpha_desc_rgb,
+            "alpha_desc_ir": args.alpha_desc_ir,
             "rgb_box_count": rgb_accum.count.clone(),
             "ir_box_count": ir_accum.count.clone(),
             "class_proto_rgb": class_proto_rgb,
@@ -842,8 +854,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--alpha-class", type=float, default=ALPHA_CLASS,
                    help="Mixing weight for class embeddings (CLIP anchor dominates).")
-    p.add_argument("--alpha-desc", type=float, default=ALPHA_DESC,
-                   help="Mixing weight for description embeddings.")
+    # Back-compat: --alpha-desc sets both; --alpha-desc-rgb / --alpha-desc-ir override.
+    default_desc_rgb = ALPHA_DESC if ALPHA_DESC is not None else ALPHA_DESC_RGB
+    default_desc_ir = ALPHA_DESC if ALPHA_DESC is not None else ALPHA_DESC_IR
+    p.add_argument("--alpha-desc", type=float, default=None,
+                   help="Back-compat: shorthand that sets both --alpha-desc-rgb "
+                        "and --alpha-desc-ir to the same value.")
+    p.add_argument("--alpha-desc-rgb", type=float, default=default_desc_rgb,
+                   help="Mixing weight for RGB description embeddings.")
+    p.add_argument("--alpha-desc-ir", type=float, default=default_desc_ir,
+                   help="Mixing weight for IR description embeddings.")
 
     p.add_argument("--split", default=SPLIT,
                    help="Which dataset split(s) to scan. Comma-separated.")
@@ -895,6 +915,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     # Fall back to the module-level IR_REPLACE constant if nothing was passed on the CLI.
     if args.ir_replace is None:
         args.ir_replace = list(IR_REPLACE) if IR_REPLACE else None
+    # Back-compat: --alpha-desc (or module-level ALPHA_DESC) overrides both modalities.
+    if args.alpha_desc is not None:
+        args.alpha_desc_rgb = args.alpha_desc
+        args.alpha_desc_ir = args.alpha_desc
+    elif ALPHA_DESC is not None:
+        args.alpha_desc_rgb = ALPHA_DESC
+        args.alpha_desc_ir = ALPHA_DESC
     _validate_config(args)
     run_adaptation(args)
 

@@ -702,6 +702,41 @@ class AlignmentRegion(nn.Module):
         self.debug_stats = {}
 
         # ---------------------------
+        # Scheme A: AR warmup + L_align auxiliary loss
+        # ---------------------------
+        # Problem: at step 0, proj_rgb / proj_ir are (synchronised) random
+        # projections in 512d CLIP space. On IR inputs, their class-similarity
+        # direction is systematically negative (ir_raw_class_mean ≈ -0.4). If
+        # AR immediately uses those immature projections to reproject/rewrite
+        # IR features via `back_ir`, the gradient signal is anti-aligned and
+        # pushes `proj_ir` deeper into the wrong half-space (a runaway
+        # negative-feedback loop).
+        #
+        # Fix (Scheme A):
+        #   1. Warmup:   AR's forward effectively passes features through
+        #                unchanged for the first `warmup_steps` training steps.
+        #                Concretely, `ar_strength = 0` kills the reproject and
+        #                output-gate deltas (see `_forward_prefusion`). During
+        #                warmup, feat_rgb / feat_ir flow into `fuse` directly
+        #                and AR behaves like a plain mid-fusion.
+        #   2. Rampup:   Over the next `rampup_steps`, `ar_strength` linearly
+        #                goes 0 → 1, smoothly enabling AR's rewrite.
+        #   3. L_align:  From step 0 onwards, every AR forward emits an
+        #                auxiliary alignment loss pulling proj_rgb / proj_ir
+        #                toward the nearest class embedding direction.
+        #                RGBTARDetModel.loss() picks this up and adds it to
+        #                the total loss with weight `align_loss_weight`.
+        #                This gives proj_* direct supervision independent of
+        #                AR's rewrite path, so IR projection has time to
+        #                mature *before* being used to rewrite features.
+        #
+        # Only active during training; inference always uses full AR.
+        self.warmup_steps = 500
+        self.rampup_steps = 1000
+        self._step_counter = 0
+        self.align_loss = None  # read by RGBTARDetModel.loss()
+
+        # ---------------------------
         # Symmetric IR init
         # ---------------------------
         # RGB and IR branches are intentionally structurally identical. We
@@ -1291,6 +1326,53 @@ class AlignmentRegion(nn.Module):
         self.debug_stats["proj_ir_mean"] = self._safe_mean(proj_ir_norm)
         self.debug_stats["proj_ir_std"] = self._safe_std(proj_ir_norm)
 
+        # ----------------------------
+        # Scheme A: L_align auxiliary loss (always active during training)
+        #
+        # Pulls proj_rgb / proj_ir toward their nearest class embedding
+        # direction.  This is the only gradient path for proj_* during
+        # warmup (when `ar_strength = 0` the downstream AR rewrite has no
+        # effect on feat_*).  After warmup both L_align and the AR path
+        # contribute gradients to proj_*.
+        # ----------------------------
+        if self.training:
+            proj_rgb_f = proj_rgb_norm.float()   # (B, C, H, W)
+            proj_ir_f = proj_ir_norm.float()
+            cls_f = class_norm.float()           # (B, K, C) after _ensure_batch_text
+            if cls_f.dim() == 2:
+                cls_f = cls_f.unsqueeze(0)       # (1, K, C) -> broadcast over batch
+            # (B, C, H, W) x (B, K, C) -> (B, K, H, W)
+            sim_rgb = torch.einsum("bchw,bkc->bkhw", proj_rgb_f, cls_f)
+            sim_ir = torch.einsum("bchw,bkc->bkhw", proj_ir_f, cls_f)
+            max_sim_rgb = sim_rgb.max(dim=1).values
+            max_sim_ir = sim_ir.max(dim=1).values
+            align_loss_rgb = 1.0 - max_sim_rgb.mean()
+            align_loss_ir = 1.0 - max_sim_ir.mean()
+            self.align_loss = align_loss_rgb + align_loss_ir
+            self.debug_stats["align_loss_rgb"] = float(align_loss_rgb.detach().item())
+            self.debug_stats["align_loss_ir"] = float(align_loss_ir.detach().item())
+        else:
+            self.align_loss = None
+
+        # ----------------------------
+        # Scheme A: compute ar_strength (warmup + rampup schedule)
+        # ----------------------------
+        if self.training:
+            self._step_counter += 1
+        step = int(self._step_counter)
+        warmup = int(self.warmup_steps)
+        rampup = int(self.rampup_steps)
+        if not self.training:
+            ar_strength = 1.0
+        elif step <= warmup:
+            ar_strength = 0.0
+        elif step <= warmup + rampup:
+            ar_strength = float(step - warmup) / float(max(1, rampup))
+        else:
+            ar_strength = 1.0
+        self.debug_stats["ar_step"] = float(step)
+        self.debug_stats["ar_strength"] = float(ar_strength)
+
         # build states
         state_rgb = self._build_branch_state(
             proj_rgb_norm, class_norm, desc_rgb_norm, desc_rgb_map, scale, tag="rgb"
@@ -1428,9 +1510,9 @@ class AlignmentRegion(nn.Module):
         self.debug_stats["back_ir_mean"] = self._safe_mean(back_ir)
         self.debug_stats["back_ir_std"] = self._safe_std(back_ir)
 
-        # gated residual write-back
-        feat_rgb = feat_rgb + self.reproj_gate_rgb.sigmoid() * back_rgb
-        feat_ir = feat_ir + self.reproj_gate_ir.sigmoid() * back_ir
+        # gated residual write-back (scaled by ar_strength for Scheme A warmup)
+        feat_rgb = feat_rgb + (ar_strength * self.reproj_gate_rgb.sigmoid()) * back_rgb
+        feat_ir = feat_ir + (ar_strength * self.reproj_gate_ir.sigmoid()) * back_ir
 
         # lightweight modulation using class confidence
         attn_rgb = (state_rgb["raw_class_sim"] + self.attn_bias).sigmoid().unsqueeze(1)
@@ -1442,8 +1524,8 @@ class AlignmentRegion(nn.Module):
         self.debug_stats["mod_rgb_mean"] = self._safe_mean(mod_rgb)
         self.debug_stats["mod_ir_mean"] = self._safe_mean(mod_ir)
 
-        feat_rgb = feat_rgb * (1.0 + self.output_gate.sigmoid() * mod_rgb)
-        feat_ir = feat_ir * (1.0 + self.output_gate.sigmoid() * mod_ir)
+        feat_rgb = feat_rgb * (1.0 + (ar_strength * self.output_gate.sigmoid()) * mod_rgb)
+        feat_ir = feat_ir * (1.0 + (ar_strength * self.output_gate.sigmoid()) * mod_ir)
 
         self.debug_stats["rgb_delta_ratio"] = self._feature_delta_ratio(feat_rgb_before, feat_rgb)
         self.debug_stats["ir_delta_ratio"] = self._feature_delta_ratio(feat_ir_before, feat_ir)

@@ -971,6 +971,7 @@ class RGBTARDetModel(DetectionModel):
         self.desc_rgb_class_map = None  # (N_desc_rgb,) long tensor mapping each desc to class idx
         self.desc_ir_class_map = None   # (N_desc_ir,) long tensor mapping each desc to class idx
         self.mapping_loss_weight = 0.1  # keep configurable
+        self.align_loss_weight = 0.1    # Scheme A: L_align auxiliary loss weight
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
     def load(self, weights, verbose=True):
@@ -1447,6 +1448,14 @@ class RGBTARDetModel(DetectionModel):
             weight = getattr(self, "mapping_loss_weight", 0.1)
             loss = loss + mapping_loss * weight
 
+        # Scheme A: auxiliary alignment loss. Pulls proj_rgb / proj_ir toward
+        # the nearest class embedding so the projections can mature during the
+        # AR warmup window (when the AR rewrite path is disabled).
+        align_loss = self._get_ar_align_loss()
+        if align_loss is not None and torch.isfinite(align_loss) and align_loss.item() > 0:
+            weight = getattr(self, "align_loss_weight", 0.1)
+            loss = loss + align_loss * weight
+
         # Guard: if loss is NaN/Inf, skip this step to avoid corrupting all parameters
         if not torch.isfinite(loss):
             LOGGER.warning("[AR] Loss is NaN/Inf, returning zero loss for this step")
@@ -1467,6 +1476,23 @@ class RGBTARDetModel(DetectionModel):
                 else:
                     loss_val = getattr(m, "mapping_loss", None)
 
+                if loss_val is not None:
+                    total = total + loss_val
+                    count += 1
+
+        if count == 0:
+            return torch.tensor(0.0, device=device)
+        return total
+
+    def _get_ar_align_loss(self):
+        """Collect L_align auxiliary losses from all AR modules (Scheme A)."""
+        device = next(self.parameters()).device
+        total = torch.tensor(0.0, device=device)
+        count = 0
+
+        for m in self.model.modules():
+            if isinstance(m, AR):
+                loss_val = getattr(m, "align_loss", None)
                 if loss_val is not None:
                     total = total + loss_val
                     count += 1

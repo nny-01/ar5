@@ -495,12 +495,18 @@ class AlignmentRegion(nn.Module):
         - Same-modal / cross-modal only choose ONE better branch
         - Finally project back to vision space
 
-    YAML usage example:
+    YAML usage example (shared threshold for both modalities, old behaviour):
         - [[rgb_idx, ir_idx], 1, AlignmentRegion, [256, 1, 128, 1, 512, False, 1, 0.5, 0.20, 0.20]]
+
+    YAML usage example (per-modality thresholds, write a 2-element list
+    ``[rgb, ir]`` in place of the scalar):
+        - [[rgb_idx, ir_idx], 1, AlignmentRegion, [256, 1, 128, 1, 512, False, 1, 0.5, [0.20, 0.15], [0.20, 0.15]]]
 
     Args kept unchanged as much as possible:
         c1, c2, n=1, ec=128, nh=1, gc=512, shortcut=False, g=1, e=0.5,
         threshold=0.20, desc_high=0.20
+    ``threshold`` and ``desc_high`` may each be a scalar (shared by RGB and
+    IR, the previous behaviour) or a 2-element list/tuple ``[rgb, ir]``.
     """
 
     def __init__(
@@ -521,8 +527,28 @@ class AlignmentRegion(nn.Module):
         self.c = int(c2 * e)
         self.nh = nh
         self.gc = gc
-        self.threshold = threshold
-        self.desc_high = desc_high
+
+        def _split_modality(value, name: str):
+            if isinstance(value, (list, tuple)):
+                if len(value) != 2:
+                    raise ValueError(
+                        f"AlignmentRegion.{name} must be a scalar or a 2-element "
+                        f"list/tuple [rgb, ir]; got length {len(value)}."
+                    )
+                return float(value[0]), float(value[1])
+            return float(value), float(value)
+
+        thr_rgb, thr_ir = _split_modality(threshold, "threshold")
+        dhi_rgb, dhi_ir = _split_modality(desc_high, "desc_high")
+        self.threshold_rgb = thr_rgb
+        self.threshold_ir = thr_ir
+        self.desc_high_rgb = dhi_rgb
+        self.desc_high_ir = dhi_ir
+        # keep the pre-split attribute names as back-compat aliases (point at
+        # the RGB values); downstream code that only queried .threshold /
+        # .desc_high for logging continues to work.
+        self.threshold = thr_rgb
+        self.desc_high = dhi_rgb
 
         # ---------------------------
         # RGB branch
@@ -982,9 +1008,11 @@ class AlignmentRegion(nn.Module):
                 proj_norm, desc_norm, desc_class_map, best_class_idx, scale
             )
 
-        confident_mask = (raw_class_sim >= self.threshold)
+        thr = self.threshold_ir if tag == "ir" else self.threshold_rgb
+        dhi = self.desc_high_ir if tag == "ir" else self.desc_high_rgb
+        confident_mask = (raw_class_sim >= thr)
         uncertain_mask = ~confident_mask
-        recover_mask = uncertain_mask & (raw_desc_sim >= self.desc_high)
+        recover_mask = uncertain_mask & (raw_desc_sim >= dhi)
 
         # entropy for debug
         class_prob = F.softmax(class_sim, dim=1)
@@ -1069,8 +1097,10 @@ class AlignmentRegion(nn.Module):
         self.updated_desc_ir = desc_ir_norm.detach()
 
         self.debug_stats["scale"] = self._safe_mean(scale)
-        self.debug_stats["threshold"] = float(self.threshold)
-        self.debug_stats["desc_high"] = float(self.desc_high)
+        self.debug_stats["threshold_rgb"] = float(self.threshold_rgb)
+        self.debug_stats["threshold_ir"] = float(self.threshold_ir)
+        self.debug_stats["desc_high_rgb"] = float(self.desc_high_rgb)
+        self.debug_stats["desc_high_ir"] = float(self.desc_high_ir)
         self.debug_stats["reproj_gate_rgb_sigmoid"] = float(self.reproj_gate_rgb.sigmoid().detach().item())
         self.debug_stats["reproj_gate_ir_sigmoid"] = float(self.reproj_gate_ir.sigmoid().detach().item())
         self.debug_stats["output_gate_sigmoid"] = float(self.output_gate.sigmoid().detach().item())

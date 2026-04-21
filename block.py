@@ -1258,6 +1258,34 @@ class AlignmentRegion(nn.Module):
             - Same / cross only choose one better branch
             - Keep vision->text and text->vision unchanged
         """
+        # ----------------------------------------------------------
+        # Backward compatibility: checkpoints trained with older
+        # block.py may pickle AR modules missing per-modality
+        # threshold/desc_high/target_confident_ratio attributes and the
+        # Scheme A warmup / align_loss attributes. Auto-populate from
+        # legacy scalar attributes (or sane defaults) on first forward
+        # so that val.py / inference on old checkpoints keeps working.
+        # ----------------------------------------------------------
+        if not hasattr(self, "threshold_rgb"):
+            thr = float(getattr(self, "threshold", 0.20))
+            self.threshold_rgb = thr
+            self.threshold_ir = thr
+        if not hasattr(self, "desc_high_rgb"):
+            dhi = float(getattr(self, "desc_high", 0.20))
+            self.desc_high_rgb = dhi
+            self.desc_high_ir = dhi
+        if not hasattr(self, "target_confident_ratio_rgb"):
+            self.target_confident_ratio_rgb = None
+            self.target_confident_ratio_ir = None
+        if not hasattr(self, "warmup_steps"):
+            self.warmup_steps = 500
+        if not hasattr(self, "rampup_steps"):
+            self.rampup_steps = 1000
+        if not hasattr(self, "_step_counter"):
+            self._step_counter = 0
+        if not hasattr(self, "align_loss"):
+            self.align_loss = None
+
         cls, desc_rgb, desc_ir, desc_rgb_map, desc_ir_map = self._resolve_embeddings(
             feat_rgb, feat_ir, class_embeds, desc_rgb, desc_ir
         )

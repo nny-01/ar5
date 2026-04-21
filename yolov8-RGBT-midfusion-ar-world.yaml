@@ -1,0 +1,101 @@
+# Ultralytics YOLO, AGPL-3.0 license
+# YOLOv8/11 RGBT MidFusion + Auxiliary AR  + WorldDetect (contrastive) head
+# -------------------------------------------------------------------------
+# 相比原 `yolov8-RGBT-midfusion-ar.yaml` 的唯一区别：
+#     最后一层 Detect  →  WorldDetect
+# 这样 `class_adapted_embeddings.pt` 通过 `txt_feats` 直接作为分类权重，
+# 而不是仅被 AR 模块使用。AR 仍作为 P4 上的辅助增强保留。
+#
+# 配套改动（都在 nny-01/ar5 分支上）：
+#   tasks.py: RGBTARDetModel.predict() 新增 WorldDetect 分支，
+#             自动把 self.txt_feats 喂给最后一层。
+#
+# 不需要改 user.py 和 train_rgbt_ar.py。
+
+# Parameters
+nc: 80
+scales:
+  # [depth, width, max_channels]
+  s: [0.33, 0.50, 1024]
+  m: [0.67, 0.75, 768]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.25, 512]
+
+ch: 4
+
+backbone:
+  # ---------------- RGB branch ----------------
+  - [-1, 1, Silence, []]              # 0
+  - [0, 1, SilenceChannel, [0, 3]]    # 1  RGB input (3ch)
+  - [-1, 1, Conv, [64, 3, 2]]         # 2
+  - [-1, 1, Conv, [128, 3, 2]]        # 3
+  - [-1, 3, C2f, [128, True]]         # 4
+  - [-1, 1, Conv, [256, 3, 2]]        # 5
+  - [-1, 6, C2f, [256, True]]         # 6   RGB P3
+  - [-1, 1, Conv, [512, 3, 2]]        # 7
+  - [-1, 6, C2f, [512, True]]         # 8   RGB P4
+  - [-1, 1, Conv, [1024, 3, 2]]       # 9
+  - [-1, 3, C2f, [1024, True]]        # 10  RGB P5
+
+  # ---------------- IR branch ----------------
+  - [0, 1, SilenceChannel, [3, 4]]    # 11 IR input (1ch)
+  - [-1, 1, Conv, [64, 3, 2]]         # 12
+  - [-1, 1, Conv, [128, 3, 2]]        # 13
+  - [-1, 3, C2f, [128, True]]         # 14
+  - [-1, 1, Conv, [256, 3, 2]]        # 15
+  - [-1, 6, C2f, [256, True]]         # 16  IR P3
+  - [-1, 1, Conv, [512, 3, 2]]        # 17
+  - [-1, 6, C2f, [512, True]]         # 18  IR P4
+  - [-1, 1, Conv, [1024, 3, 2]]       # 19
+  - [-1, 3, C2f, [1024, True]]        # 20  IR P5
+
+  # ---------------- P5 conservative fusion ----------------
+  - [[10, 20], 1, Concat, [1]]        # 21  fused P5
+  - [21, 1, SPPF, [1024, 5]]          # 22  fused P5 after SPPF
+
+head:
+  # ---------------- top-down ----------------
+  - [22, 1, nn.Upsample, [None, 2, "nearest"]]   # 23
+
+  # P4: 主融合路径
+  - [[8, 18], 1, Concat, [1]]                    # 24
+  - [[23, 24], 1, Concat, [1]]                   # 25
+  - [-1, 3, C2f, [512]]                          # 26  P4/16 main
+
+  # AR: P4 主融合之后作为辅助增强
+  # 参数顺序: [c2, n, ec, nh, gc, shortcut, g, e, threshold(=floor), desc_high, target_confident_ratio]
+  #   threshold (floor, per-modality):   top-k 模式下它不是"判断是否 confident 的门槛"，
+  #                                      而是"被 top-k 选中的最低必要值"。设得太高会把 top-k
+  #                                      踢出去 → confident_ratio 达不到 target。推荐取
+  #                                      当前 raw_class_mean - 0.25 ~ 0.30。
+  #   desc_high (per-modality):          uncertain 位置要走 cross-modal recover 的门槛。
+  #                                      控制 recover_ratio。取当前 raw_desc_mean - 0.25 左右。
+  #   target_confident_ratio:            每张图每个模态保留 confident 的比例。None = 老的
+  #                                      固定阈值模式；scalar 或 [rgb,ir] = top-k 模式。
+  #                                      推荐 0.4（confident 40%, 留 60% 给 recover+passthrough）。
+  - [[8, 18], 1, AlignmentRegion, [256, 1, 128, 1, 512, False, 1, 0.5, [0.0, 0.0], [0.13, 0.20], [0.4, 0.4]]]  # 27
+
+  - [[26, 27], 1, Concat, [1]]                   # 28
+  - [-1, 3, C2f, [512]]                          # 29  enhanced P4/16
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]   # 30
+
+  - [[6, 16], 1, Concat, [1]]                    # 31
+  - [[30, 31], 1, Concat, [1]]                   # 32
+  - [-1, 3, C2f, [256]]                          # 33  P3/8-small
+
+  # ---------------- bottom-up ----------------
+  - [-1, 1, Conv, [256, 3, 2]]                   # 34
+  - [[-1, 29], 1, Concat, [1]]                   # 35
+  - [-1, 3, C2f, [512]]                          # 36  P4/16-medium
+
+  - [-1, 1, Conv, [512, 3, 2]]                   # 37
+  - [[-1, 22], 1, Concat, [1]]                   # 38
+  - [-1, 3, C2f, [1024]]                         # 39  P5/32-large
+
+  # 核心变动：Detect -> WorldDetect
+  # 参数 [nc, embed, with_bn]:
+  #   nc      = 类别数（由数据集 YAML 覆盖为 6）
+  #   embed   = 文本嵌入维度（CLIP ViT-B/32 → 512）
+  #   with_bn = 是否在 txt_feats 上加 BatchNorm；False 保留 CLIP 归一化
+  - [[33, 36, 39], 1, WorldDetect, [nc, 512, False]]  # 40

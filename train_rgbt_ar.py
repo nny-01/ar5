@@ -100,6 +100,10 @@ class RGBTARTrainer(DetectionTrainer):
         self.desc_rgb_class_map_path = getattr(self, "desc_rgb_class_map_path", None)
         self.desc_ir_class_map_path = getattr(self, "desc_ir_class_map_path", None)
         self.rel_class_map_path = getattr(self, "rel_class_map_path", None)  # compatibility only
+        # Offline, dataset-adapted class embeddings (see tools/offline_embedding_adapter.py).
+        # When set, on_pretrain_routine_end replaces the CLIP-derived class embeddings with
+        # the contents of this file after set_classes() runs.
+        self.class_emb_path = getattr(self, "class_emb_path", None)
         self.add_callback("on_pretrain_routine_end", self._on_pretrain_routine_end_cb)
     # ... 其他方法保持不变（get_model, build_dataset, preprocess_batch 等） ...
     def _on_pretrain_routine_end_cb(self, trainer=None):
@@ -138,6 +142,14 @@ class RGBTARTrainer(DetectionTrainer):
         desc_ir_path = getattr(self, "desc_ir_path", None) or getattr(self.args, "desc_ir_path", None)
         desc_rgb_cmap_path = getattr(self, "desc_rgb_class_map_path", None) or getattr(self.args, "desc_rgb_class_map_path", None)
         desc_ir_cmap_path = getattr(self, "desc_ir_class_map_path", None) or getattr(self.args, "desc_ir_class_map_path", None)
+        class_emb_path = getattr(self, "class_emb_path", None) or getattr(self.args, "class_emb_path", None)
+
+        # 2.5) 加载离线适配后的类别嵌入（可选，覆盖 set_classes() 的 CLIP 输出）
+        if class_emb_path:
+            if not Path(class_emb_path).exists():
+                raise FileNotFoundError(f"[AR] class_emb_path 不存在: {class_emb_path}")
+            model.load_class_embeddings(class_emb_path)
+            LOGGER.info(f"[AR] 已加载离线适配的类别嵌入: {class_emb_path}")
 
         # 3) 加载关系嵌入（可选）
         if rel_path:
@@ -161,6 +173,8 @@ class RGBTARTrainer(DetectionTrainer):
         if getattr(self, "ema", None) and getattr(self.ema, "ema", None) is not None:
             ema_model = de_parallel(self.ema.ema)
             ema_model.set_classes(class_names)
+            if class_emb_path:
+                ema_model.load_class_embeddings(class_emb_path)
             if rel_path:
                 ema_model.load_relational_embeddings(rel_path, rel_class_map_path=None)
             if desc_rgb_path and desc_ir_path:
@@ -214,6 +228,9 @@ class RGBTARTrainer(DetectionTrainer):
             desc_ir_path = getattr(self, "desc_ir_path", None)
             desc_rgb_cmap_path = getattr(self, "desc_rgb_class_map_path", None)
             desc_ir_cmap_path = getattr(self, "desc_ir_class_map_path", None)
+            class_emb_path = getattr(self, "class_emb_path", None)
+            if class_emb_path:
+                model.load_class_embeddings(class_emb_path)
             if rel_path:
                 model.load_relational_embeddings(rel_path)
             if desc_rgb_path and desc_ir_path:

@@ -495,12 +495,38 @@ class AlignmentRegion(nn.Module):
         - Same-modal / cross-modal only choose ONE better branch
         - Finally project back to vision space
 
-    YAML usage example:
+    YAML usage example (shared threshold for both modalities, old behaviour):
         - [[rgb_idx, ir_idx], 1, AlignmentRegion, [256, 1, 128, 1, 512, False, 1, 0.5, 0.20, 0.20]]
 
-    Args kept unchanged as much as possible:
+    YAML usage example (per-modality thresholds, write a 2-element list
+    ``[rgb, ir]`` in place of the scalar):
+        - [[rgb_idx, ir_idx], 1, AlignmentRegion, [256, 1, 128, 1, 512, False, 1, 0.5, [0.20, 0.15], [0.20, 0.15]]]
+
+    YAML usage example with adaptive per-image top-k% confident gating
+    (enables Plan A: picks the top 50% most-confident positions per image
+    per modality, floored by ``threshold``; use to break the runaway
+    "strong modality monopolises confident, weak modality gets rewritten"
+    feedback loop):
+        - [[rgb_idx, ir_idx], 1, AlignmentRegion, [256, 1, 128, 1, 512, False, 1, 0.5, 0.15, 0.20, 0.5]]
+    or with independent RGB/IR target ratios:
+        - [[rgb_idx, ir_idx], 1, AlignmentRegion, [256, 1, 128, 1, 512, False, 1, 0.5, 0.15, 0.20, [0.5, 0.5]]]
+
+    Args:
         c1, c2, n=1, ec=128, nh=1, gc=512, shortcut=False, g=1, e=0.5,
-        threshold=0.20, desc_high=0.20
+        threshold=0.20, desc_high=0.20, target_confident_ratio=None
+    ``threshold`` and ``desc_high`` may each be a scalar (shared by RGB and
+    IR, the previous behaviour) or a 2-element list/tuple ``[rgb, ir]``.
+    ``target_confident_ratio`` (scalar or ``[rgb, ir]``):
+      - ``None`` (default) keeps the original fixed-threshold rule
+        ``confident = (raw_class_sim >= threshold)``.
+      - A value in ``(0, 1]`` switches to **adaptive per-image top-k%**
+        gating: per sample in the batch, per modality, take the top
+        ``target_confident_ratio`` fraction of spatial positions and mark
+        them confident, floored by ``threshold`` (positions below
+        ``threshold`` are never promoted even if they land in the top-k).
+        This guarantees both modalities have comparable confident counts
+        regardless of absolute similarity scale, eliminating the
+        strong/weak asymmetry feedback loop.
     """
 
     def __init__(
@@ -516,13 +542,60 @@ class AlignmentRegion(nn.Module):
         e=0.5,
         threshold=0.20,
         desc_high=0.20,
+        target_confident_ratio=None,
     ):
         super().__init__()
         self.c = int(c2 * e)
         self.nh = nh
         self.gc = gc
-        self.threshold = threshold
-        self.desc_high = desc_high
+
+        def _split_modality(value, name: str):
+            if isinstance(value, (list, tuple)):
+                if len(value) != 2:
+                    raise ValueError(
+                        f"AlignmentRegion.{name} must be a scalar or a 2-element "
+                        f"list/tuple [rgb, ir]; got length {len(value)}."
+                    )
+                return float(value[0]), float(value[1])
+            return float(value), float(value)
+
+        def _split_optional_modality(value, name: str):
+            if value is None:
+                return None, None
+            if isinstance(value, (list, tuple)):
+                if len(value) != 2:
+                    raise ValueError(
+                        f"AlignmentRegion.{name} must be None, a scalar or a "
+                        f"2-element list/tuple [rgb, ir]; got length {len(value)}."
+                    )
+                return (None if value[0] is None else float(value[0]),
+                        None if value[1] is None else float(value[1]))
+            return float(value), float(value)
+
+        thr_rgb, thr_ir = _split_modality(threshold, "threshold")
+        dhi_rgb, dhi_ir = _split_modality(desc_high, "desc_high")
+        tgt_rgb, tgt_ir = _split_optional_modality(
+            target_confident_ratio, "target_confident_ratio"
+        )
+        for _name, _v in (
+            ("target_confident_ratio_rgb", tgt_rgb),
+            ("target_confident_ratio_ir", tgt_ir),
+        ):
+            if _v is not None and not (0.0 < _v <= 1.0):
+                raise ValueError(
+                    f"AlignmentRegion.{_name} must be in (0, 1] or None; got {_v}."
+                )
+        self.threshold_rgb = thr_rgb
+        self.threshold_ir = thr_ir
+        self.desc_high_rgb = dhi_rgb
+        self.desc_high_ir = dhi_ir
+        self.target_confident_ratio_rgb = tgt_rgb
+        self.target_confident_ratio_ir = tgt_ir
+        # keep the pre-split attribute names as back-compat aliases (point at
+        # the RGB values); downstream code that only queried .threshold /
+        # .desc_high for logging continues to work.
+        self.threshold = thr_rgb
+        self.desc_high = dhi_rgb
 
         # ---------------------------
         # RGB branch
@@ -628,6 +701,123 @@ class AlignmentRegion(nn.Module):
         self._debug_iter = 0
         self.debug_stats = {}
 
+        # ---------------------------
+        # Scheme A: AR warmup + L_align auxiliary loss
+        # ---------------------------
+        # Problem: at step 0, proj_rgb / proj_ir are (synchronised) random
+        # projections in 512d CLIP space. On IR inputs, their class-similarity
+        # direction is systematically negative (ir_raw_class_mean ≈ -0.4). If
+        # AR immediately uses those immature projections to reproject/rewrite
+        # IR features via `back_ir`, the gradient signal is anti-aligned and
+        # pushes `proj_ir` deeper into the wrong half-space (a runaway
+        # negative-feedback loop).
+        #
+        # Fix (Scheme A):
+        #   1. Warmup:   AR's forward effectively passes features through
+        #                unchanged for the first `warmup_steps` training steps.
+        #                Concretely, `ar_strength = 0` kills the reproject and
+        #                output-gate deltas (see `_forward_prefusion`). During
+        #                warmup, feat_rgb / feat_ir flow into `fuse` directly
+        #                and AR behaves like a plain mid-fusion.
+        #   2. Rampup:   Over the next `rampup_steps`, `ar_strength` linearly
+        #                goes 0 → 1, smoothly enabling AR's rewrite.
+        #   3. L_align:  From step 0 onwards, every AR forward emits an
+        #                auxiliary alignment loss pulling proj_rgb / proj_ir
+        #                toward the nearest class embedding direction.
+        #                RGBTARDetModel.loss() picks this up and adds it to
+        #                the total loss with weight `align_loss_weight`.
+        #                This gives proj_* direct supervision independent of
+        #                AR's rewrite path, so IR projection has time to
+        #                mature *before* being used to rewrite features.
+        #
+        # Only active during training; inference always uses full AR.
+        self.warmup_steps = 500
+        self.rampup_steps = 1000
+        self._step_counter = 0
+        self.align_loss = None  # read by RGBTARDetModel.loss()
+
+        # ---------------------------
+        # Symmetric IR init
+        # ---------------------------
+        # RGB and IR branches are intentionally structurally identical. We
+        # therefore force the IR branch to start from **exactly** the same
+        # parameter tensors as the RGB branch.
+        #
+        # Why: pretrained YOLO checkpoints do not contain AR module weights, so
+        # both `proj_rgb` and `proj_ir` (and their sibling Conv/C2f modules)
+        # start from independent random inits. Independent random 1x1 projections
+        # in 512d space can easily produce *opposite sign* alignments with the
+        # class embeddings — empirically we observed
+        #     rgb_raw_class_mean = +0.53
+        #     ir_raw_class_mean  = -0.39
+        # which breaks Plan A (the IR branch sees every position below floor and
+        # nothing can be marked confident).
+        #
+        # Mirroring RGB -> IR at the end of __init__ guarantees identical
+        # projections at step 0. Any divergence afterwards is driven purely by
+        # the two modalities seeing different feature distributions through
+        # otherwise-identical modules, which is the *intended* source of
+        # asymmetry (learned, not random).
+        self._sync_ir_from_rgb()
+
+    def _sync_ir_from_rgb(self):
+        """Copy RGB-branch parameters and buffers into the matching IR-branch
+        modules so both start from identical tensors.
+
+        Pairs synced:
+            cv1_rgb -> cv1_ir
+            cv2_rgb -> cv2_ir
+            m_rgb   -> m_ir         (nn.ModuleList)
+            proj_rgb -> proj_ir
+            back_rgb -> back_ir
+
+        Uses ``load_state_dict(strict=True)`` on each pair, which also copies
+        BatchNorm running_mean / running_var / num_batches_tracked, matching the
+        post-training behaviour of the RGB BNs onto the IR BNs at t=0.
+        """
+        import torch as _torch  # local alias, avoid top-of-file touching
+        with _torch.no_grad():
+            pairs = [
+                ("cv1", self.cv1_rgb, self.cv1_ir),
+                ("cv2", self.cv2_rgb, self.cv2_ir),
+                ("m",   self.m_rgb,   self.m_ir),
+                ("proj", self.proj_rgb, self.proj_ir),
+                ("back", self.back_rgb, self.back_ir),
+            ]
+            tensors_copied = 0
+            for _, src, dst in pairs:
+                # Guard against shape mismatches (would only happen if someone
+                # tweaks one branch's definition and forgets the other). We
+                # iterate state_dict entries manually so a single mismatched
+                # tensor does not abort the entire sync.
+                src_sd = src.state_dict()
+                dst_sd = dst.state_dict()
+                new_dst_sd = {}
+                for k, v in dst_sd.items():
+                    if k in src_sd and src_sd[k].shape == v.shape:
+                        new_dst_sd[k] = src_sd[k].clone()
+                        tensors_copied += 1
+                    else:
+                        new_dst_sd[k] = v
+                dst.load_state_dict(new_dst_sd, strict=True)
+
+        # Post-sync sanity check: verify proj_rgb.0.weight == proj_ir.0.weight.
+        # If these differ, either the sync never ran (file mismatch) or PyTorch
+        # cache is stale. The message prints unconditionally so the user can
+        # confirm in their training log that the right block.py is loaded.
+        try:
+            w_rgb = self.proj_rgb[0].weight.detach()
+            w_ir  = self.proj_ir[0].weight.detach()
+            max_abs_diff = (w_rgb - w_ir).abs().max().item()
+            print(
+                f"[AlignmentRegion] _sync_ir_from_rgb: "
+                f"copied {tensors_copied} tensors, "
+                f"proj_rgb.weight vs proj_ir.weight max|diff|={max_abs_diff:.2e} "
+                f"(should be 0.00e+00 if sync worked)"
+            )
+        except Exception as e:
+            print(f"[AlignmentRegion] _sync_ir_from_rgb sanity-check failed: {e!r}")
+
     # ============================================================
     # public setters
     # ============================================================
@@ -715,6 +905,40 @@ class AlignmentRegion(nn.Module):
         if mask is None:
             return 0.0
         return float(mask.detach().float().mean().item())
+
+    @staticmethod
+    def _adaptive_topk_mask(sim: torch.Tensor, target_ratio: float,
+                            floor: float) -> torch.Tensor:
+        """Per-image adaptive top-k% mask with an absolute floor.
+
+        ``sim`` has shape ``(B, H, W)``. For each image (row in the batch)
+        we mark the top ``ceil(target_ratio * H*W)`` spatial positions as
+        True; positions below ``floor`` are then demoted to False so a
+        very-low-similarity image never ends up with bogus "confident"
+        positions just because they happen to be the local maxima.
+
+        The point of this is to make the confident count comparable across
+        modalities regardless of their absolute similarity scale: if IR's
+        class-similarity distribution sits, say, 0.05 lower than RGB's
+        globally, a fixed threshold would let RGB monopolise the confident
+        branch while IR is flooded into the recover branch (which then
+        rewrites IR features against RGB's confident bank — the runaway
+        feedback loop the user observed). Taking top-k% per image keeps
+        confident counts balanced.
+        """
+        if target_ratio >= 1.0:
+            # Everything above the floor counts; skip the topk work.
+            return sim >= floor
+        B = sim.shape[0]
+        flat = sim.reshape(B, -1)
+        n = flat.shape[1]
+        # round up so that very small feature maps still yield at least a
+        # handful of confident positions.
+        k = max(1, min(n, int(math.ceil(target_ratio * n))))
+        # kth largest value per row (= adaptive threshold for that image)
+        kth = flat.topk(k, dim=1, largest=True).values[:, -1:]
+        mask = (flat >= kth) & (flat >= floor)
+        return mask.reshape(sim.shape)
 
     def _feature_delta_ratio(self, before, after):
         num = (after - before).detach().pow(2).mean().sqrt()
@@ -982,9 +1206,17 @@ class AlignmentRegion(nn.Module):
                 proj_norm, desc_norm, desc_class_map, best_class_idx, scale
             )
 
-        confident_mask = (raw_class_sim >= self.threshold)
+        thr = self.threshold_ir if tag == "ir" else self.threshold_rgb
+        dhi = self.desc_high_ir if tag == "ir" else self.desc_high_rgb
+        tgt = (self.target_confident_ratio_ir if tag == "ir"
+               else self.target_confident_ratio_rgb)
+        if tgt is None:
+            confident_mask = (raw_class_sim >= thr)
+        else:
+            confident_mask = self._adaptive_topk_mask(raw_class_sim, tgt, thr)
+            self.debug_stats[f"{tag}_target_confident_ratio"] = float(tgt)
         uncertain_mask = ~confident_mask
-        recover_mask = uncertain_mask & (raw_desc_sim >= self.desc_high)
+        recover_mask = uncertain_mask & (raw_desc_sim >= dhi)
 
         # entropy for debug
         class_prob = F.softmax(class_sim, dim=1)
@@ -1026,6 +1258,34 @@ class AlignmentRegion(nn.Module):
             - Same / cross only choose one better branch
             - Keep vision->text and text->vision unchanged
         """
+        # ----------------------------------------------------------
+        # Backward compatibility: checkpoints trained with older
+        # block.py may pickle AR modules missing per-modality
+        # threshold/desc_high/target_confident_ratio attributes and the
+        # Scheme A warmup / align_loss attributes. Auto-populate from
+        # legacy scalar attributes (or sane defaults) on first forward
+        # so that val.py / inference on old checkpoints keeps working.
+        # ----------------------------------------------------------
+        if not hasattr(self, "threshold_rgb"):
+            thr = float(getattr(self, "threshold", 0.20))
+            self.threshold_rgb = thr
+            self.threshold_ir = thr
+        if not hasattr(self, "desc_high_rgb"):
+            dhi = float(getattr(self, "desc_high", 0.20))
+            self.desc_high_rgb = dhi
+            self.desc_high_ir = dhi
+        if not hasattr(self, "target_confident_ratio_rgb"):
+            self.target_confident_ratio_rgb = None
+            self.target_confident_ratio_ir = None
+        if not hasattr(self, "warmup_steps"):
+            self.warmup_steps = 500
+        if not hasattr(self, "rampup_steps"):
+            self.rampup_steps = 1000
+        if not hasattr(self, "_step_counter"):
+            self._step_counter = 0
+        if not hasattr(self, "align_loss"):
+            self.align_loss = None
+
         cls, desc_rgb, desc_ir, desc_rgb_map, desc_ir_map = self._resolve_embeddings(
             feat_rgb, feat_ir, class_embeds, desc_rgb, desc_ir
         )
@@ -1069,8 +1329,10 @@ class AlignmentRegion(nn.Module):
         self.updated_desc_ir = desc_ir_norm.detach()
 
         self.debug_stats["scale"] = self._safe_mean(scale)
-        self.debug_stats["threshold"] = float(self.threshold)
-        self.debug_stats["desc_high"] = float(self.desc_high)
+        self.debug_stats["threshold_rgb"] = float(self.threshold_rgb)
+        self.debug_stats["threshold_ir"] = float(self.threshold_ir)
+        self.debug_stats["desc_high_rgb"] = float(self.desc_high_rgb)
+        self.debug_stats["desc_high_ir"] = float(self.desc_high_ir)
         self.debug_stats["reproj_gate_rgb_sigmoid"] = float(self.reproj_gate_rgb.sigmoid().detach().item())
         self.debug_stats["reproj_gate_ir_sigmoid"] = float(self.reproj_gate_ir.sigmoid().detach().item())
         self.debug_stats["output_gate_sigmoid"] = float(self.output_gate.sigmoid().detach().item())
@@ -1091,6 +1353,53 @@ class AlignmentRegion(nn.Module):
         self.debug_stats["proj_rgb_std"] = self._safe_std(proj_rgb_norm)
         self.debug_stats["proj_ir_mean"] = self._safe_mean(proj_ir_norm)
         self.debug_stats["proj_ir_std"] = self._safe_std(proj_ir_norm)
+
+        # ----------------------------
+        # Scheme A: L_align auxiliary loss (always active during training)
+        #
+        # Pulls proj_rgb / proj_ir toward their nearest class embedding
+        # direction.  This is the only gradient path for proj_* during
+        # warmup (when `ar_strength = 0` the downstream AR rewrite has no
+        # effect on feat_*).  After warmup both L_align and the AR path
+        # contribute gradients to proj_*.
+        # ----------------------------
+        if self.training:
+            proj_rgb_f = proj_rgb_norm.float()   # (B, C, H, W)
+            proj_ir_f = proj_ir_norm.float()
+            cls_f = class_norm.float()           # (B, K, C) after _ensure_batch_text
+            if cls_f.dim() == 2:
+                cls_f = cls_f.unsqueeze(0)       # (1, K, C) -> broadcast over batch
+            # (B, C, H, W) x (B, K, C) -> (B, K, H, W)
+            sim_rgb = torch.einsum("bchw,bkc->bkhw", proj_rgb_f, cls_f)
+            sim_ir = torch.einsum("bchw,bkc->bkhw", proj_ir_f, cls_f)
+            max_sim_rgb = sim_rgb.max(dim=1).values
+            max_sim_ir = sim_ir.max(dim=1).values
+            align_loss_rgb = 1.0 - max_sim_rgb.mean()
+            align_loss_ir = 1.0 - max_sim_ir.mean()
+            self.align_loss = align_loss_rgb + align_loss_ir
+            self.debug_stats["align_loss_rgb"] = float(align_loss_rgb.detach().item())
+            self.debug_stats["align_loss_ir"] = float(align_loss_ir.detach().item())
+        else:
+            self.align_loss = None
+
+        # ----------------------------
+        # Scheme A: compute ar_strength (warmup + rampup schedule)
+        # ----------------------------
+        if self.training:
+            self._step_counter += 1
+        step = int(self._step_counter)
+        warmup = int(self.warmup_steps)
+        rampup = int(self.rampup_steps)
+        if not self.training:
+            ar_strength = 1.0
+        elif step <= warmup:
+            ar_strength = 0.0
+        elif step <= warmup + rampup:
+            ar_strength = float(step - warmup) / float(max(1, rampup))
+        else:
+            ar_strength = 1.0
+        self.debug_stats["ar_step"] = float(step)
+        self.debug_stats["ar_strength"] = float(ar_strength)
 
         # build states
         state_rgb = self._build_branch_state(
@@ -1229,9 +1538,9 @@ class AlignmentRegion(nn.Module):
         self.debug_stats["back_ir_mean"] = self._safe_mean(back_ir)
         self.debug_stats["back_ir_std"] = self._safe_std(back_ir)
 
-        # gated residual write-back
-        feat_rgb = feat_rgb + self.reproj_gate_rgb.sigmoid() * back_rgb
-        feat_ir = feat_ir + self.reproj_gate_ir.sigmoid() * back_ir
+        # gated residual write-back (scaled by ar_strength for Scheme A warmup)
+        feat_rgb = feat_rgb + (ar_strength * self.reproj_gate_rgb.sigmoid()) * back_rgb
+        feat_ir = feat_ir + (ar_strength * self.reproj_gate_ir.sigmoid()) * back_ir
 
         # lightweight modulation using class confidence
         attn_rgb = (state_rgb["raw_class_sim"] + self.attn_bias).sigmoid().unsqueeze(1)
@@ -1243,8 +1552,8 @@ class AlignmentRegion(nn.Module):
         self.debug_stats["mod_rgb_mean"] = self._safe_mean(mod_rgb)
         self.debug_stats["mod_ir_mean"] = self._safe_mean(mod_ir)
 
-        feat_rgb = feat_rgb * (1.0 + self.output_gate.sigmoid() * mod_rgb)
-        feat_ir = feat_ir * (1.0 + self.output_gate.sigmoid() * mod_ir)
+        feat_rgb = feat_rgb * (1.0 + (ar_strength * self.output_gate.sigmoid()) * mod_rgb)
+        feat_ir = feat_ir * (1.0 + (ar_strength * self.output_gate.sigmoid()) * mod_ir)
 
         self.debug_stats["rgb_delta_ratio"] = self._feature_delta_ratio(feat_rgb_before, feat_rgb)
         self.debug_stats["ir_delta_ratio"] = self._feature_delta_ratio(feat_ir_before, feat_ir)

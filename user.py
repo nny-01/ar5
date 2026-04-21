@@ -60,8 +60,15 @@ SKIP_PRETRAINED = False  # 兼容保留；是否生效取决于你的 Trainer �
 # --- AR 描述嵌入（per-class 模式，dict 格式含 class_map）---
 # 使用 generate_prompts.py --mode perclass 生成的文件
 # 文件格式: {'embeddings': tensor(N, C), 'class_map': tensor(N,)}
-DESC_RGB = "prompts/M3FD_prompts/perclass_desc_rgb_embeddings.pt"
-DESC_IR = "prompts/M3FD_prompts/perclass_desc_ir_embeddings.pt"
+# 训练前请先运行 tools/offline_embedding_adapter.py 生成 *_adapted_*.pt，
+# 这里再切换到 adapted 路径。原始文件（perclass_desc_*.pt）只作为 adapter 的输入。
+DESC_RGB = "prompts/M3FD_prompts/adapted/desc_rgb_adapted_embeddings.pt"
+DESC_IR = "prompts/M3FD_prompts/adapted/desc_ir_adapted_embeddings.pt"
+
+# --- AR 类别嵌入（离线适配后的 class embedding，替换 CLIP 即时编码）---
+# 由 tools/offline_embedding_adapter.py 生成，shape (nc, 512)，L2 归一化。
+# 若为 None 则退回 CLIP set_classes() 原始行为。
+CLASS_EMB = "prompts/M3FD_prompts/adapted/class_adapted_embeddings.pt"
 
 # --- AR 关系嵌入（可选，所有类别共享）---
 REL = "prompts/M3FD_prompts/shared_relational_embeddings.pt"
@@ -105,6 +112,7 @@ def main():
     desc_ir_path = _check_optional_file(DESC_IR, "DESC_IR") if DESC_IR else None
     rel_path = _check_optional_file(REL, "REL") if REL else None
     rel_map_path = _check_optional_file(REL_MAP, "REL_MAP") if REL_MAP else None
+    class_emb_path = _check_optional_file(CLASS_EMB, "CLASS_EMB") if CLASS_EMB else None
 
     # 构建训练参数
     overrides = {
@@ -140,7 +148,8 @@ def main():
     trainer.desc_rgb_path = desc_rgb_path
     trainer.desc_ir_path = desc_ir_path
     trainer.rel_path = rel_path
-    
+    trainer.class_emb_path = class_emb_path
+
     # ✅ 通过环境变量传递（DDP 多卡模式用）
     if desc_rgb_path:
         os.environ["AR_DESC_RGB_PATH"] = desc_rgb_path
@@ -148,6 +157,8 @@ def main():
         os.environ["AR_DESC_IR_PATH"] = desc_ir_path
     if rel_path:
         os.environ["AR_REL_PATH"] = rel_path
+    if class_emb_path:
+        os.environ["AR_CLASS_EMB_PATH"] = class_emb_path
     # 给 Trainer 挂载嵌入路径
     # ------------------------------------------------------------
     # 描述嵌入：per-class RGB / IR 描述（含 class_map）
@@ -206,6 +217,7 @@ def main():
     print(f"  WEIGHTS:   {weights_path if weights_path else 'None'}")
     print(f"  DESC_RGB:  {desc_rgb_path if desc_rgb_path else 'None'}")
     print(f"  DESC_IR:   {desc_ir_path if desc_ir_path else 'None'}")
+    print(f"  CLASS_EMB: {class_emb_path if class_emb_path else 'None (fallback 到 CLIP set_classes)'}")
     print(f"  REL:       {rel_path if rel_path else 'None'}")
     print(f"  REL_MAP:   {rel_map_path if rel_map_path else 'None (new AR 默认不用)'}")
     print(f"  Note:      DESC .pt files use dict format with embedded class_map")

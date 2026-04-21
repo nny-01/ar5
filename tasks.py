@@ -971,7 +971,238 @@ class RGBTARDetModel(DetectionModel):
         self.desc_rgb_class_map = None  # (N_desc_rgb,) long tensor mapping each desc to class idx
         self.desc_ir_class_map = None   # (N_desc_ir,) long tensor mapping each desc to class idx
         self.mapping_loss_weight = 0.1  # keep configurable
+        self.align_loss_weight = 0.1    # Scheme A: L_align auxiliary loss weight
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+
+    def load(self, weights, verbose=True):
+        """Load single-stream pretrained weights (e.g. ``yolov8s.pt``) into **both**
+        the RGB and IR branches of this dual-stream RGBT model.
+
+        Why the base ``BaseModel.load`` is insufficient
+        -----------------------------------------------
+        The stock ``BaseModel.load`` only does::
+
+            csd = intersect_dicts(csd, self.state_dict())  # exact-key match
+            self.load_state_dict(csd, strict=False)
+
+        Single-stream YOLO checkpoints use keys like ``model.0.conv.weight`` starting
+        at layer 0. This dual-stream RGBT YAML, however, starts with a ``Silence``
+        (layer 0) + ``SilenceChannel`` (layer 1) preamble, so the real RGB backbone
+        begins at layer **2**; the IR backbone begins at layer **12** (after a
+        second ``SilenceChannel``). Neither branch's layer indices line up with the
+        pretrained checkpoint, so ``intersect_dicts`` returns ~0 backbone matches
+        and **both branches are effectively randomly initialized**.
+
+        Observable symptom
+        ------------------
+        Because both branches are random, the AR module sees two random projections
+        feeding ``proj_rgb`` and ``proj_ir``. Depending on the RNG state, one side
+        can happen to produce a "collapsed" projection (all positions pointing in
+        one direction, ``raw_class_mean`` ≈ 0.4) while the other produces a
+        "dispersed" projection (near-orthogonal to class emb, ``raw_class_mean``
+        ≈ 0.08). This shows up in training debug as::
+
+            rgb_raw_class_mean: 0.08  →  rgb_confident_ratio: 0.02
+            ir_raw_class_mean:  0.44  →  ir_confident_ratio:  0.40
+
+        Fix
+        ---
+        We explicitly remap each pretrained ``model.N.*`` key to **two** RGBT
+        layer indices — the RGB twin at ``N + rgb_offset`` and the IR twin at
+        ``N + ir_offset``. Offsets are inferred from the YAML by locating the
+        two ``SilenceChannel`` modules (one per branch).
+
+        Special case: the very first conv of the IR branch has ``in_channels=1``
+        (grayscale) whereas the pretrained first conv has ``in_channels=3`` (RGB).
+        We collapse the three pretrained input channels to one by averaging,
+        which preserves the learned spatial filter pattern.
+
+        Fallback
+        --------
+        If the YAML layout does not contain two ``SilenceChannel`` modules (e.g.
+        single-stream AR model or an exotic fusion topology), we gracefully fall
+        back to the stock ``intersect_dicts`` behaviour.
+        """
+        model = weights["model"] if isinstance(weights, dict) else weights
+        csd = model.float().state_dict()
+        own_sd = self.state_dict()
+
+        # ------------------------------------------------------------------
+        # Step 0: detect branch structure by scanning the assembled model
+        # for SilenceChannel sentinels. Two sentinels => dual-stream RGBT;
+        # otherwise fall back to the stock loader.
+        # ------------------------------------------------------------------
+        silence_channel_idxs = []
+        try:
+            for i, layer in enumerate(self.model):
+                if type(layer).__name__ == "SilenceChannel":
+                    silence_channel_idxs.append(i)
+        except Exception:
+            silence_channel_idxs = []
+
+        if len(silence_channel_idxs) < 2:
+            # Not a dual-stream layout: stock behaviour.
+            csd_std = intersect_dicts(csd, own_sd)
+            self.load_state_dict(csd_std, strict=False)
+            if verbose:
+                LOGGER.info(
+                    f"RGBTARDetModel: dual-stream layout not detected; "
+                    f"transferred {len(csd_std)}/{len(own_sd)} items from pretrained "
+                    f"(stock intersect_dicts behaviour)"
+                )
+            return
+
+        # First real RGB conv index (right after the first SilenceChannel) and
+        # first real IR conv index (right after the second SilenceChannel).
+        # The pretrained checkpoint's layer 0 corresponds to the **first real
+        # conv** of the single-stream reference backbone — i.e. our RGB layer
+        # ``silence_channel_idxs[0] + 1``.
+        rgb_first_layer = silence_channel_idxs[0] + 1
+        ir_first_layer = silence_channel_idxs[1] + 1
+
+        # We only remap backbone-range keys. The pretrained backbone typically
+        # spans layers 0..9 in a single-stream yolov8s checkpoint; this RGBT
+        # YAML has exactly (ir_first_layer - rgb_first_layer - 1) backbone
+        # layers per branch (the -1 accounts for the IR SilenceChannel that
+        # sits between the two backbones). Any pretrained key outside that
+        # range (head, SPPF, detect, etc.) is handed to the stock loader with
+        # its own indices and only matches RGBT layers that happen to share
+        # the same absolute index (neck / fusion / SPPF / head keys after the
+        # two backbones, which often do line up for mid-fusion YAMLs).
+        backbone_len = ir_first_layer - rgb_first_layer - 1  # e.g. 9 for yolov8s
+        backbone_pretrained_range = range(0, backbone_len)
+
+        remapped_rgb = {}
+        remapped_ir = {}
+        first_conv_rgb_loaded = 0
+        first_conv_ir_adapted = 0
+
+        def _try_assign(target_dict, ir_key_flag, k_remapped, src_tensor):
+            """Assign src_tensor to target_dict[k_remapped] if shape matches
+            own_sd; handle the IR first-conv 3→1 channel adaptation."""
+            nonlocal first_conv_ir_adapted, first_conv_rgb_loaded
+            if k_remapped not in own_sd:
+                return False
+            dst_shape = own_sd[k_remapped].shape
+            if src_tensor.shape == dst_shape:
+                target_dict[k_remapped] = src_tensor
+                if (not ir_key_flag) and k_remapped.endswith(".conv.weight") \
+                        and src_tensor.dim() == 4 and src_tensor.shape[1] == 3:
+                    first_conv_rgb_loaded += 1
+                return True
+            # IR first conv adaptation: 3-channel pretrained → 1-channel IR
+            if (
+                ir_key_flag
+                and src_tensor.dim() == 4
+                and dst_shape[1] == 1
+                and src_tensor.shape[1] == 3
+                and src_tensor.shape[0] == dst_shape[0]
+                and src_tensor.shape[2:] == dst_shape[2:]
+            ):
+                target_dict[k_remapped] = src_tensor.mean(dim=1, keepdim=True)
+                first_conv_ir_adapted += 1
+                return True
+            return False
+
+        # ------------------------------------------------------------------
+        # Step 1: remap backbone-range pretrained keys to both branches.
+        # ------------------------------------------------------------------
+        for k, v in csd.items():
+            if not k.startswith("model."):
+                continue
+            parts = k.split(".")
+            if len(parts) < 3:
+                continue
+            try:
+                pre_idx = int(parts[1])
+            except ValueError:
+                continue
+            if pre_idx not in backbone_pretrained_range:
+                continue
+
+            # RGB twin
+            rgb_parts = parts.copy()
+            rgb_parts[1] = str(pre_idx + rgb_first_layer)
+            _try_assign(remapped_rgb, False, ".".join(rgb_parts), v)
+
+            # IR twin
+            ir_parts = parts.copy()
+            ir_parts[1] = str(pre_idx + ir_first_layer)
+            _try_assign(remapped_ir, True, ".".join(ir_parts), v)
+
+        # ------------------------------------------------------------------
+        # Step 2: for non-backbone keys (head / neck / SPPF / Detect), fall
+        # back to exact-key intersection against own_sd. This recovers any
+        # post-backbone layers whose absolute indices happen to line up.
+        # ------------------------------------------------------------------
+        remainder = {
+            k: v for k, v in csd.items()
+            if not (k.startswith("model.") and len(k.split(".")) >= 3
+                    and k.split(".")[1].isdigit()
+                    and int(k.split(".")[1]) in backbone_pretrained_range)
+        }
+        remainder_intersected = intersect_dicts(remainder, own_sd)
+
+        # ------------------------------------------------------------------
+        # Step 3: combined load. The three dicts have disjoint keys by
+        # construction (RGB-branch, IR-branch, and non-backbone post-fusion
+        # layers).
+        # ------------------------------------------------------------------
+        full_load = {**remapped_rgb, **remapped_ir, **remainder_intersected}
+        self.load_state_dict(full_load, strict=False)
+
+        # ------------------------------------------------------------------
+        # Step 4: reset IR branch BatchNorm running statistics.
+        #
+        # Why: the IR branch conv weights are useful initialisations (they are
+        # RGB pretrained filters, or 3→1 averaged for the first conv), but the
+        # RGB pretrained BN running_mean / running_var encode RGB-image pixel
+        # statistics. Feeding 1-channel thermal / grayscale IR data through
+        # these RGB-tuned BNs systematically shifts features in the "wrong"
+        # direction in CLIP space, producing the ``ir_raw_class_mean ≈ -0.3``
+        # (anti-aligned with every class embedding) behaviour observed
+        # empirically.
+        #
+        # Resetting to the PyTorch default (mean=0, var=1, tracked=0) lets
+        # each IR BN freely adapt to the actual IR activation distribution
+        # during training, avoiding the systematic sign inversion. The affine
+        # parameters (``weight``, ``bias``) are kept as-loaded so the learned
+        # scale/shift is preserved.
+        # ------------------------------------------------------------------
+        import torch.nn as _nn
+        ir_layer_range = range(ir_first_layer, ir_first_layer + backbone_len)
+        bn_reset_count = 0
+        try:
+            for ir_idx in ir_layer_range:
+                if ir_idx >= len(self.model):
+                    break
+                ir_layer = self.model[ir_idx]
+                for sub in ir_layer.modules():
+                    if isinstance(sub, (_nn.BatchNorm2d, _nn.BatchNorm1d,
+                                        _nn.BatchNorm3d, _nn.SyncBatchNorm)):
+                        if sub.running_mean is not None:
+                            sub.running_mean.zero_()
+                        if sub.running_var is not None:
+                            sub.running_var.fill_(1.0)
+                        if sub.num_batches_tracked is not None:
+                            sub.num_batches_tracked.zero_()
+                        bn_reset_count += 1
+        except Exception as _e:
+            LOGGER.warning(
+                f"RGBTARDetModel.load: failed to reset IR BN running stats: {_e!r}"
+            )
+
+        if verbose:
+            LOGGER.info(
+                f"RGBTARDetModel.load: dual-stream remap: "
+                f"RGB branch loaded {len(remapped_rgb)} keys "
+                f"(first-conv RGB: {first_conv_rgb_loaded}), "
+                f"IR branch loaded {len(remapped_ir)} keys "
+                f"(first-conv 3→1 averaged: {first_conv_ir_adapted}), "
+                f"post-fusion intersect: {len(remainder_intersected)} keys, "
+                f"IR BN running-stats reset: {bn_reset_count}. "
+                f"rgb_first_layer={rgb_first_layer}, ir_first_layer={ir_first_layer}."
+            )
 
     def set_classes(self, text, batch=80):
         """Encode class names with CLIP and store embeddings in all AR modules.
@@ -994,14 +1225,74 @@ class RGBTARDetModel(DetectionModel):
         self.model[-1].nc = len(text)
 
         # Push class embeddings into all AR modules
+        count = self._sync_class_to_ar()
+
+        LOGGER.info(
+            f"RGBTARDetModel: set {len(text)} classes, stored in {count} AR module(s)"
+        )
+
+    def _sync_class_to_ar(self):
+        """Push the currently-stored class embeddings (``self.txt_feats``)
+        into every AR module in the model.
+
+        Returns:
+            int: number of AR modules that received the embeddings.
+        """
         count = 0
         for m in self.model.modules():
             if isinstance(m, AR):
                 m.set_class_embeddings(self.txt_feats)
                 count += 1
+        return count
 
+    def load_class_embeddings(self, path):
+        """Load pre-computed class embeddings from a ``.pt`` file and push
+        them into every AR module.
+
+        This is the offline counterpart of :meth:`set_classes`. It bypasses
+        the CLIP text encoder entirely so the embeddings can come from the
+        offline dataset-adaptation pipeline (see
+        ``tools/offline_embedding_adapter.py``).
+
+        The file may contain either:
+
+        * a plain ``Tensor`` of shape ``(nc, C)`` or ``(1, nc, C)``, or
+        * a ``dict`` with key ``embeddings`` holding such a tensor.
+
+        The ``nc`` dimension must match the current head's class count.
+        """
+        data = torch.load(str(path), map_location="cpu")
+        if isinstance(data, dict):
+            feats = data.get("embeddings", None)
+            if feats is None:
+                raise ValueError(
+                    f"[AR] class embedding file {path} is a dict but has no 'embeddings' key"
+                )
+        else:
+            feats = data
+        if not torch.is_tensor(feats):
+            raise TypeError(f"[AR] unsupported class embedding payload in {path}: {type(feats)}")
+        feats = feats.float()
+        if feats.dim() == 2:
+            feats = feats.unsqueeze(0)  # (1, nc, C)
+        if feats.dim() != 3:
+            raise ValueError(
+                f"[AR] class embedding tensor must be 2D or 3D, got shape {tuple(feats.shape)}"
+            )
+
+        expected_nc = getattr(self.model[-1], "nc", feats.shape[1])
+        if feats.shape[1] != expected_nc:
+            raise ValueError(
+                f"[AR] class embedding count mismatch: file has {feats.shape[1]} classes but "
+                f"head expects {expected_nc}"
+            )
+
+        self.txt_feats = feats
+        self.model[-1].nc = feats.shape[1]
+        count = self._sync_class_to_ar()
         LOGGER.info(
-            f"RGBTARDetModel: set {len(text)} classes, stored in {count} AR module(s)"
+            f"[AR] Loaded adapted class embeddings from {path}: "
+            f"shape={tuple(feats.shape)}, synced to {count} AR module(s)"
         )
 
     def _sync_rel_to_ar(self):
@@ -1119,6 +1410,11 @@ class RGBTARDetModel(DetectionModel):
 
             if isinstance(m, AR):
                 x = m(x, txt_feats, desc_rgb, desc_ir)
+            elif isinstance(m, WorldDetect):
+                # Route class embeddings into WorldDetect's contrastive classifier.
+                # Works with both standard Detect YAMLs (no-op, this branch never triggers)
+                # and World YAMLs where the last layer is WorldDetect.
+                x = m(x, txt_feats)
             else:
                 x = m(x)
 
@@ -1152,6 +1448,14 @@ class RGBTARDetModel(DetectionModel):
             weight = getattr(self, "mapping_loss_weight", 0.1)
             loss = loss + mapping_loss * weight
 
+        # Scheme A: auxiliary alignment loss. Pulls proj_rgb / proj_ir toward
+        # the nearest class embedding so the projections can mature during the
+        # AR warmup window (when the AR rewrite path is disabled).
+        align_loss = self._get_ar_align_loss()
+        if align_loss is not None and torch.isfinite(align_loss) and align_loss.item() > 0:
+            weight = getattr(self, "align_loss_weight", 0.1)
+            loss = loss + align_loss * weight
+
         # Guard: if loss is NaN/Inf, skip this step to avoid corrupting all parameters
         if not torch.isfinite(loss):
             LOGGER.warning("[AR] Loss is NaN/Inf, returning zero loss for this step")
@@ -1172,6 +1476,23 @@ class RGBTARDetModel(DetectionModel):
                 else:
                     loss_val = getattr(m, "mapping_loss", None)
 
+                if loss_val is not None:
+                    total = total + loss_val
+                    count += 1
+
+        if count == 0:
+            return torch.tensor(0.0, device=device)
+        return total
+
+    def _get_ar_align_loss(self):
+        """Collect L_align auxiliary losses from all AR modules (Scheme A)."""
+        device = next(self.parameters()).device
+        total = torch.tensor(0.0, device=device)
+        count = 0
+
+        for m in self.model.modules():
+            if isinstance(m, AR):
+                loss_val = getattr(m, "align_loss", None)
                 if loss_val is not None:
                     total = total + loss_val
                     count += 1
